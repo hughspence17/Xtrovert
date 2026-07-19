@@ -4,55 +4,55 @@
 // Expo SDK 57 / React Native 0.86 / React Navigation 7
 // ============================================================================
 
+import {
+    createBottomTabNavigator,
+    type BottomTabNavigationProp,
+} from '@react-navigation/bottom-tabs';
+import { DarkTheme, NavigationContainer, useNavigation } from '@react-navigation/native';
+import * as Haptics from 'expo-haptics';
+import { StatusBar } from 'expo-status-bar';
 import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
+    createContext,
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
 } from 'react';
 import {
-  ActivityIndicator,
-  Animated,
-  Dimensions,
-  Easing,
-  FlatList,
-  Image,
-  KeyboardAvoidingView,
-  Modal,
-  Platform,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  View,
-  type PressableProps,
-  type StyleProp,
-  type ViewStyle,
+    ActivityIndicator,
+    Animated,
+    Dimensions,
+    Easing,
+    FlatList,
+    Image,
+    KeyboardAvoidingView,
+    Modal,
+    Platform,
+    Pressable,
+    ScrollView,
+    StyleSheet,
+    Switch,
+    Text,
+    TextInput,
+    View,
+    type PressableProps,
+    type StyleProp,
+    type ViewStyle,
 } from 'react-native';
 import Reanimated, {
-  useAnimatedScrollHandler,
-  useAnimatedStyle,
-  useSharedValue,
-  withRepeat,
-  withSpring,
-  withTiming,
-  type SharedValue,
+    useAnimatedScrollHandler,
+    useAnimatedStyle,
+    useSharedValue,
+    withRepeat,
+    withSpring,
+    withTiming,
+    type SharedValue,
 } from 'react-native-reanimated';
-import { StatusBar } from 'expo-status-bar';
-import * as Haptics from 'expo-haptics';
-import { NavigationContainer, DarkTheme, useNavigation } from '@react-navigation/native';
 import {
-  createBottomTabNavigator,
-  type BottomTabNavigationProp,
-} from '@react-navigation/bottom-tabs';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
+    SafeAreaProvider,
+    useSafeAreaInsets,
 } from 'react-native-safe-area-context';
 
 // ============================================================================
@@ -62,45 +62,53 @@ import {
 // ============================================================================
 
 const COLORS = {
-  // Deep obsidian — near-black, deep forest dark background.
-  canvas: '#080C0A',
+  // Deep obsidian — near-black with a subtle cool moss tint.
+  canvas: '#0B0E0D',
   // Solid fill behind the fixed top header so scrolled content cleanly
   // disappears beneath it without ever bleeding through.
-  headerBg: '#080C0A',
-  // Dark tactical moss — standard surface containers.
-  surface: '#101713',
-  // Brushed slate green — elevated cards and modal bodies.
-  elevated: '#16201A',
-  // Razor-thin neon border used on cards, quests, and clickable sections.
-  border: 'rgba(0, 230, 118, 0.30)',
+  headerBg: '#0B0E0D',
+  // Dark brushed tactical slate — standard surface containers.
+  surface: '#131A16',
+  // Card / modal body fill — dark brushed tactical slate.
+  elevated: '#131A16',
+  // Subtle 1px solid structural border around all cards.
+  border: '#1E2C24',
   // Dimmer hairline for internal dividers and quiet outlines.
-  divider: 'rgba(110, 231, 183, 0.14)',
-  // Primary accent — electric neon green for active buttons, critical
-  // numbers, and glowing accents.
-  neon: '#00E676',
-  // Secondary accent — deep emerald for secondary buttons and borders.
+  divider: 'rgba(142, 175, 157, 0.16)',
+  // Primary accent — high-voltage neon green for the logo 'X', active
+  // buttons, progress fills, active streak days, and outer glows.
+  neon: '#00FF66',
+  // Secondary accent — deep emerald for secondary buttons and pressed fills.
   emerald: '#10B981',
   // Ambient glow used for box-shadows around active elements.
-  glow: 'rgba(0, 230, 118, 0.22)',
-  // Crisp high-contrast off-white primary typography.
-  body: '#F0FDF4',
-  // Soft muted sage green for subtitles and timestamps.
-  muted: '#6EE7B7',
+  glow: 'rgba(0, 255, 102, 0.22)',
+  // Crisp, bold off-white primary typography.
+  body: '#F3F4F6',
+  // Sage green for subtitles, fractions, and descriptions.
+  muted: '#8EAF9D',
   disabled: '#1E2A22',
   // Dark ink used on top of neon-filled buttons.
   onNeon: '#04150C',
 };
 
 const MONO = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
-// Clean, punchy geometric sans-serif for display type and body copy.
+// San Francisco (SF Pro) system stack for regular text/body copy, with a
+// clean native sans-serif fallback on Android so it never crashes.
 const SANS = Platform.select({
-  ios: 'Avenir Next',
+  ios: 'SF Pro Text',
+  android: 'sans-serif',
+  default: 'System',
+});
+// SF Pro Display for large hero numbers and major headers (bold, tight
+// letter-spacing), falling back to the native condensed sans on Android.
+const DISPLAY = Platform.select({
+  ios: 'SF Pro Display',
   android: 'sans-serif-medium',
-  default: 'sans-serif',
+  default: 'System',
 });
 
-// Height of the fixed header's brand row (XTROVERT wordmark + streak badge).
-const HEADER_BRAND_HEIGHT = 48;
+// Height of the fixed header's brand row (XTROVERT wordmark + status pills).
+const HEADER_BRAND_HEIGHT = 56;
 
 // Height of the Live Activity ticker row rendered inside the fixed header,
 // directly below the brand row. Every screen pads its scrollable content by
@@ -111,6 +119,16 @@ const LIVE_TICKER_HEIGHT = 30;
 // Flat reward applied to a user's Support Score whenever they reply to
 // someone else's community post.
 const SUPPORT_SCORE_REWARD = 10;
+
+// Flat reward applied to a user's Social Score for every verified quest
+// submission. Bound to both the award logic and the challenge XP label so
+// the two can never drift out of sync.
+const SOCIAL_SCORE_REWARD = 50;
+
+// Ceilings used to render the Social/Support "growth" progress bars and
+// percentages on the Home and Progress screens.
+const MAX_SOCIAL_SCORE = 1000;
+const MAX_SUPPORT_SCORE = 1000;
 
 // Page size used for the Journal archive's infinite scroll — both the
 // initial page and every subsequent `onEndReached` load.
@@ -184,11 +202,17 @@ interface JournalEntry {
   text: string;
 }
 
+interface DailyQuote {
+  text: string;
+  author: string;
+}
+
 interface AppContextShape {
   userProfile: UserProfile;
   activeQuest: Quest;
   communityFeed: FeedPost[];
   userJournals: JournalEntry[];
+  dailyQuote: DailyQuote;
   submitVerification: (text: string, broadcast: boolean) => void;
   loadNextChallenge: () => void;
   addReply: (postId: string, text: string) => void;
@@ -396,6 +420,68 @@ const TICKER_ITEMS: string[] = [
   '@Rob_Ironside logged a new exposure rep',
 ];
 
+// Daily motivation pool for the Home screen's Daily Quote card. The provider
+// selects one deterministically per calendar day so the quote is dynamic
+// (never a hardcoded JSX string) yet stable across a single day's session.
+const QUOTE_POOL: DailyQuote[] = [
+  { text: 'Growth happens outside your comfort zone.', author: 'Keep showing up' },
+  { text: 'Courage is a muscle. Train it every single day.', author: 'Field Doctrine' },
+  { text: 'The rep is in your head, not in the room.', author: 'Operator Log' },
+  { text: 'Discomfort is just data. Move toward it.', author: 'Keep showing up' },
+  { text: 'You become what you repeatedly dare to do.', author: 'Field Doctrine' },
+  { text: 'Small brave acts compound into a bold life.', author: 'Operator Log' },
+];
+
+// Ordered growth-stage titles. The user's level indexes into this list so the
+// Home screen's stage subtitle is derived dynamically from live state.
+const STAGE_TITLES: string[] = [
+  'The Seed',
+  'The Sprout',
+  'The Seedling',
+  'The Sapling',
+  'The Young Tree',
+  'The Rooted Oak',
+  'The Tall Pine',
+  'The Old Growth',
+  'The Redwood',
+  'The Ancient Grove',
+];
+
+function getStageTitle(level: number): string {
+  const index = Math.max(0, Math.min(level, STAGE_TITLES.length - 1));
+  return STAGE_TITLES[index];
+}
+
+// Derives a human difficulty label for a quest purely from its level, so the
+// Today's Challenge difficulty pill stays bound to real quest data.
+function getDifficultyLabel(level: number): string {
+  if (level <= 3) return 'Easy';
+  if (level <= 6) return 'Medium';
+  if (level <= 9) return 'Hard';
+  return 'Elite';
+}
+
+// Weekly completion state for the Day Streak tracker, derived from the live
+// streak count. Returns 7 entries (Mon→Sun): 'done' for days covered by the
+// current streak, 'missed' for earlier days this week, 'future' for upcoming.
+type DayState = 'done' | 'missed' | 'future';
+
+function getWeekProgress(streak: number, now: Date = new Date()): DayState[] {
+  const todayIndex = (now.getDay() + 6) % 7; // convert Sun=0..Sat=6 → Mon=0..Sun=6
+  const week: DayState[] = [];
+  for (let i = 0; i < 7; i += 1) {
+    if (i > todayIndex) {
+      week.push('future');
+    } else {
+      const daysAgo = todayIndex - i;
+      week.push(daysAgo < streak ? 'done' : 'missed');
+    }
+  }
+  return week;
+}
+
+const WEEKDAY_LABELS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
 // ============================================================================
 // SECTION 3 — APPLICATION STATE ENGINE (LOCAL MEMORY STORE)
 // ============================================================================
@@ -442,6 +528,14 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   const [communityFeed, setCommunityFeed] = useState<FeedPost[]>(SEED_FEED);
   const [userJournals, setUserJournals] = useState<JournalEntry[]>(SEED_JOURNALS);
 
+  // Deterministic per-calendar-day pick from the quote pool. Dynamic (rotates
+  // daily) yet stable for the lifetime of a session, so the Daily Quote card
+  // is never bound to a hardcoded string.
+  const dailyQuote = useMemo<DailyQuote>(() => {
+    const dayNumber = Math.floor(Date.now() / 86_400_000);
+    return QUOTE_POOL[dayNumber % QUOTE_POOL.length];
+  }, []);
+
   const submitVerification = useCallback(
     (text: string, broadcast: boolean) => {
       const now = new Date();
@@ -479,7 +573,7 @@ function AppProvider({ children }: { children: React.ReactNode }) {
         const alreadyCompletedToday = prev.lastCompletedDate === todayKey;
         return {
           ...prev,
-          socialScore: prev.socialScore + 50,
+          socialScore: prev.socialScore + SOCIAL_SCORE_REWARD,
           streak: alreadyCompletedToday ? prev.streak : prev.streak + 1,
           lastCompletedDate: todayKey,
         };
@@ -600,6 +694,7 @@ function AppProvider({ children }: { children: React.ReactNode }) {
       activeQuest,
       communityFeed,
       userJournals,
+      dailyQuote,
       submitVerification,
       loadNextChallenge,
       addReply,
@@ -613,6 +708,7 @@ function AppProvider({ children }: { children: React.ReactNode }) {
       activeQuest,
       communityFeed,
       userJournals,
+      dailyQuote,
       submitVerification,
       loadNextChallenge,
       addReply,
@@ -671,6 +767,106 @@ function SpringPressable({
         }}
       />
     </Reanimated.View>
+  );
+}
+
+// ============================================================================
+// DETERMINATE PROGRESS PRIMITIVES (dependency-free, pure React Native)
+// ProgressRing draws a circular neon arc mapped to a 0..1 ratio using the
+// classic two-half-disc "pie" technique (transformOrigin is supported on
+// RN 0.76+), then punches a hole to leave a ring with content centered.
+// ProgressBar is a simple horizontal track + neon fill.
+// ============================================================================
+
+function ProgressRing({
+  size,
+  strokeWidth,
+  progress,
+  color = COLORS.neon,
+  trackColor = COLORS.disabled,
+  holeColor = COLORS.elevated,
+  children,
+}: {
+  size: number;
+  strokeWidth: number;
+  progress: number;
+  color?: string;
+  trackColor?: string;
+  holeColor?: string;
+  children?: React.ReactNode;
+}) {
+  const ratio = Math.max(0, Math.min(1, progress));
+  const angle = ratio * 360;
+  const radius = size / 2;
+
+  // A right-bulging semicircle pinned so its flat (left) edge sits on the
+  // ring's center and pivots there. At 0deg it covers the right half; a
+  // track-colored copy rotated by `angle` masks it back down to an arc.
+  const half = (rotate: number, col: string, key: string) => (
+    <View
+      key={key}
+      style={{
+        position: 'absolute',
+        left: radius,
+        top: 0,
+        width: radius,
+        height: size,
+        backgroundColor: col,
+        borderTopRightRadius: radius,
+        borderBottomRightRadius: radius,
+        transformOrigin: '0% 50%',
+        transform: [{ rotate: `${rotate}deg` }],
+      }}
+    />
+  );
+
+  const layers: React.ReactNode[] = [];
+  if (ratio > 0) {
+    layers.push(half(0, color, 'a'));
+    if (angle > 180) {
+      layers.push(half(180, color, 'b'));
+    }
+    // Mask the remainder back to the track color. Skipped at a full ring,
+    // where a 360deg mask would wrap around and erase the fill.
+    if (ratio < 1) {
+      layers.push(half(angle, trackColor, 'mask'));
+    }
+  }
+
+  return (
+    <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>
+      <View
+        style={{
+          position: 'absolute',
+          width: size,
+          height: size,
+          borderRadius: radius,
+          backgroundColor: trackColor,
+          overflow: 'hidden',
+        }}
+      >
+        {layers}
+      </View>
+      <View
+        style={{
+          position: 'absolute',
+          width: size - strokeWidth * 2,
+          height: size - strokeWidth * 2,
+          borderRadius: (size - strokeWidth * 2) / 2,
+          backgroundColor: holeColor,
+        }}
+      />
+      {children}
+    </View>
+  );
+}
+
+function ProgressBar({ ratio }: { ratio: number }) {
+  const pct = Math.max(0, Math.min(1, ratio));
+  return (
+    <View style={styles.progressTrack}>
+      <View style={[styles.progressFill, { width: `${pct * 100}%` }]} />
+    </View>
   );
 }
 
@@ -771,7 +967,17 @@ function TierOrb({ level }: { level: number }) {
 
 function AppHeader() {
   const insets = useSafeAreaInsets();
-  const { userProfile } = useAppContext();
+  const { userProfile, communityFeed } = useAppContext();
+
+  // Dynamic "unread notifications" proxy: replies left by other operators on
+  // the current user's own posts. Derived from live feed state — never a
+  // hardcoded number.
+  const notificationCount = communityFeed.reduce((total, post) => {
+    if (post.handle !== userProfile.handle) {
+      return total;
+    }
+    return total + post.replies.filter((reply) => reply.handle !== userProfile.handle).length;
+  }, 0);
 
   return (
     <View pointerEvents="none" style={[styles.appHeader, { paddingTop: insets.top }]}>
@@ -779,13 +985,17 @@ function AppHeader() {
         <Text style={styles.brandWordmark} numberOfLines={1}>
           <Text style={styles.brandAccent}>X</Text>TROVERT
         </Text>
-        <View style={styles.headerStreakBadge}>
-          <Text style={styles.headerStreakGlyph}>{'\u25B2'}</Text>
-          <Text style={styles.headerStreakNumber}>{userProfile.streak}</Text>
-          <Text style={styles.headerStreakLabel}>DAY STREAK</Text>
+        <View style={styles.headerBadgeRow}>
+          <View style={styles.headerPill}>
+            <Text style={styles.headerPillGlyph}>{'\uD83D\uDD25'}</Text>
+            <Text style={styles.headerPillNumber}>{userProfile.streak}</Text>
+          </View>
+          <View style={styles.headerPill}>
+            <Text style={styles.headerPillGlyph}>{'\uD83D\uDCAC'}</Text>
+            <Text style={styles.headerPillNumber}>{notificationCount}</Text>
+          </View>
         </View>
       </View>
-      <LiveTicker />
     </View>
   );
 }
@@ -1211,6 +1421,160 @@ function SystemLockModal({ visible, onClose }: { visible: boolean; onClose: () =
   );
 }
 
+// ---- Home card: Growth Stage overview --------------------------------------
+// Circular growth ring (overall growth) + hero stage number/title bound to
+// live level, plus Social/Support growth bars. Pressing opens the existing
+// score-breakdown popup, preserving that behavior.
+function GrowthStageCard({ onPressDetails }: { onPressDetails: () => void }) {
+  const { userProfile } = useAppContext();
+  const socialRatio = userProfile.socialScore / MAX_SOCIAL_SCORE;
+  const supportRatio = userProfile.supportScore / MAX_SUPPORT_SCORE;
+  const overall = (socialRatio + supportRatio) / 2;
+  const stageTitle = getStageTitle(userProfile.level);
+
+  return (
+    <SpringPressable
+      onPress={() => {
+        triggerHaptic();
+        onPressDetails();
+      }}
+      style={({ pressed }) => [styles.card, styles.growthCard, pressed && styles.cardPressed]}
+    >
+      <View style={styles.growthTopRow}>
+        <ProgressRing size={76} strokeWidth={6} progress={overall}>
+          <Text style={styles.growthRingGlyph}>{'\uD83C\uDF31'}</Text>
+        </ProgressRing>
+        <View style={styles.growthTopText}>
+          <Text style={styles.growthLabel}>GROWTH STAGE</Text>
+          <Text style={styles.growthNumber}>{userProfile.level}</Text>
+          <Text style={styles.growthStageTitle} numberOfLines={1}>
+            {stageTitle}
+          </Text>
+          <Text style={styles.growthMotivation}>Keep growing.</Text>
+        </View>
+        <Text style={styles.growthChevron}>{'\u203A'}</Text>
+      </View>
+
+      <View style={styles.growthDivider} />
+
+      <View style={styles.growthBottomRow}>
+        <View style={styles.growthMetricCol}>
+          <Text style={styles.growthMetricLabel}>SOCIAL GROWTH</Text>
+          <Text style={styles.growthMetricValue}>
+            {userProfile.socialScore}
+            <Text style={styles.growthMetricMax}> / {MAX_SOCIAL_SCORE}</Text>
+          </Text>
+          <ProgressBar ratio={socialRatio} />
+          <Text style={styles.growthMetricPct}>{Math.round(socialRatio * 100)}%</Text>
+        </View>
+        <View style={styles.growthMetricCol}>
+          <Text style={styles.growthMetricLabel}>SUPPORT GROWTH</Text>
+          <Text style={styles.growthMetricValue}>
+            {userProfile.supportScore}
+            <Text style={styles.growthMetricMax}> / {MAX_SUPPORT_SCORE}</Text>
+          </Text>
+          <ProgressBar ratio={supportRatio} />
+          <Text style={styles.growthMetricPct}>{Math.round(supportRatio * 100)}%</Text>
+        </View>
+      </View>
+    </SpringPressable>
+  );
+}
+
+// ---- Home card: Today's Challenge (hero) -----------------------------------
+function TodayChallengeCard({ onAccept }: { onAccept: () => void }) {
+  const { activeQuest } = useAppContext();
+  const difficulty = getDifficultyLabel(activeQuest.level);
+
+  return (
+    <View style={[styles.card, styles.challengeCard]}>
+      <Text style={styles.challengeKicker}>{'\u26A1'}  TODAY&apos;S CHALLENGE</Text>
+
+      <View style={styles.challengeBodyRow}>
+        <View style={styles.challengeTextBlock}>
+          <Text style={styles.challengeTitle} numberOfLines={3}>
+            {activeQuest.title}
+          </Text>
+          <Text style={styles.challengeDesc} numberOfLines={3} ellipsizeMode="tail">
+            {activeQuest.instructions}
+          </Text>
+        </View>
+        <View style={styles.challengeGlowCircle}>
+          <Text style={styles.challengeGlowGlyph}>{'\uD83D\uDCAC'}</Text>
+        </View>
+      </View>
+
+      <View style={styles.challengeBadgeRow}>
+        <View style={styles.difficultyPill}>
+          <Text style={styles.difficultyPillText}>{difficulty}</Text>
+        </View>
+        <Text style={styles.challengeReward}>+{SOCIAL_SCORE_REWARD} Social Growth</Text>
+      </View>
+
+      <SpringPressable
+        onPress={() => {
+          triggerHaptic();
+          onAccept();
+        }}
+        style={({ pressed }) => [styles.acceptButton, pressed && styles.acceptButtonPressed]}
+      >
+        <Text style={styles.acceptButtonText}>ACCEPT CHALLENGE</Text>
+        <Text style={styles.acceptButtonArrow}>{'\u2192'}</Text>
+      </SpringPressable>
+    </View>
+  );
+}
+
+// ---- Home card: Day Streak tracker -----------------------------------------
+function DayStreakCard() {
+  const { userProfile } = useAppContext();
+  const week = getWeekProgress(userProfile.streak);
+
+  return (
+    <View style={[styles.card, styles.streakCard]}>
+      <View style={styles.streakLeft}>
+        <Text style={styles.streakFlame}>{'\uD83D\uDD25'}</Text>
+        <View>
+          <Text style={styles.streakNumber}>{userProfile.streak}</Text>
+          <Text style={styles.streakCaption}>Day Streak</Text>
+        </View>
+      </View>
+      <View style={styles.streakDays}>
+        {week.map((state, index) => (
+          <View
+            key={index}
+            style={[styles.dayCircle, state === 'done' && styles.dayCircleDone]}
+          >
+            <Text
+              style={[styles.dayCircleText, state === 'done' && styles.dayCircleTextDone]}
+            >
+              {WEEKDAY_LABELS[index]}
+            </Text>
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+// ---- Home card: Daily Quote (new structural addition) ----------------------
+function DailyQuoteCard() {
+  const { dailyQuote } = useAppContext();
+
+  return (
+    <View style={[styles.card, styles.quoteCard]}>
+      <View style={styles.quoteLeafCircle}>
+        <Text style={styles.quoteLeafGlyph}>{'\uD83C\uDF31'}</Text>
+      </View>
+      <View style={styles.quoteTextBlock}>
+        <Text style={styles.quoteText}>&ldquo;{dailyQuote.text}&rdquo;</Text>
+        <Text style={styles.quoteAuthor}>&ndash; {dailyQuote.author}</Text>
+      </View>
+      <Text style={styles.quoteMountain}>{'\uD83C\uDFD4\uFE0F'}</Text>
+    </View>
+  );
+}
+
 function ChallengesScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<BottomTabNavigationProp<RootTabParamList, 'Challenges'>>();
@@ -1218,12 +1582,11 @@ function ChallengesScreen() {
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [questCompleted, setQuestCompleted] = useState(false);
   const [questModalVisible, setQuestModalVisible] = useState(false);
-  const [lockModalVisible, setLockModalVisible] = useState(false);
   const [vitalsModalVisible, setVitalsModalVisible] = useState(false);
 
-  // Requirement 5: pressing the Challenges tab icon while the journal entry
-  // screen is open must abort the entry cleanly instead of leaving it open
-  // underneath whatever the navigator does by default.
+  // Requirement 5: pressing the Home tab icon while the verification overlay
+  // is open must abort it cleanly instead of leaving it open underneath
+  // whatever the navigator does by default.
   useEffect(() => {
     const unsubscribe = navigation.addListener('tabPress', () => {
       setOverlayVisible(false);
@@ -1241,7 +1604,6 @@ function ChallengesScreen() {
     loadNextChallenge();
     setQuestCompleted(false);
     setQuestModalVisible(false);
-    setLockModalVisible(false);
   };
 
   const scrollY = useSharedValue(0);
@@ -1260,83 +1622,47 @@ function ChallengesScreen() {
         contentContainerStyle={[
           styles.screenScroll,
           {
-            paddingTop: insets.top + HEADER_BRAND_HEIGHT + LIVE_TICKER_HEIGHT + 16,
+            paddingTop: insets.top + HEADER_BRAND_HEIGHT + 16,
             paddingBottom: insets.bottom + 80 + 140,
           },
         ]}
         showsVerticalScrollIndicator={false}
       >
-        <TierOrb level={userProfile.level} />
+        <GrowthStageCard onPressDetails={() => setVitalsModalVisible(true)} />
 
         {questCompleted ? (
           <>
-            <SectionHeader label="MISSION STATUS" centered />
             <View style={[styles.card, styles.missionCompleteCard]}>
-              <Text style={styles.questTier}>QUEST CLEARED</Text>
-              <Text style={styles.questTitle} numberOfLines={2} ellipsizeMode="tail">
+              <Text style={styles.challengeKicker}>{'\u2713'}  QUEST CLEARED</Text>
+              <Text style={styles.challengeTitle} numberOfLines={2} ellipsizeMode="tail">
                 {activeQuest.title}
               </Text>
-              <View style={styles.questDivider} />
+              <View style={styles.growthDivider} />
               <Text style={styles.bodyText}>
-                +50 Social Score awarded. Current streak: {userProfile.streak} days.
+                +{SOCIAL_SCORE_REWARD} Social Score awarded. Current streak: {userProfile.streak}{' '}
+                days.
               </Text>
             </View>
 
             <SpringPressable
               onPress={handleLoadAnother}
               style={({ pressed }) => [
-                styles.primaryButton,
-                pressed && styles.primaryButtonPressed,
+                styles.acceptButton,
+                styles.acceptButtonStandalone,
+                pressed && styles.acceptButtonPressed,
               ]}
             >
-              <Text style={styles.primaryButtonText}>{'\u27F3'}  LOAD ANOTHER CHALLENGE</Text>
+              <Text style={styles.acceptButtonText}>LOAD ANOTHER CHALLENGE</Text>
+              <Text style={styles.acceptButtonArrow}>{'\u27F3'}</Text>
             </SpringPressable>
           </>
         ) : (
-          <>
-            <SectionHeader label="ACTIVE QUEST" centered />
-            <QuestPreviewCard
-              quest={activeQuest}
-              onPress={() => {
-                triggerHaptic();
-                setQuestModalVisible(true);
-              }}
-            />
-            <SystemLockPreviewCard
-              onPress={() => {
-                triggerHaptic();
-                setLockModalVisible(true);
-              }}
-            />
-          </>
+          <TodayChallengeCard onAccept={() => setQuestModalVisible(true)} />
         )}
 
-        <SpringPressable
-          onPress={() => {
-            triggerHaptic();
-            setVitalsModalVisible(true);
-          }}
-          style={({ pressed }) => pressed && styles.cardPressed}
-        >
-          <View style={styles.sectionHeaderRow}>
-            <Text style={styles.sectionHeaderInline}>{'\u25C9'}  OPERATOR VITALS</Text>
-            <Text style={styles.accordionChevron}>{'\u203A'}</Text>
-          </View>
-          <View style={styles.card}>
-            <View style={styles.vitalsRow}>
-              <Text style={styles.vitalsLabel}>UNBROKEN STREAK</Text>
-              <Text style={styles.vitalsValue}>{userProfile.streak} DAYS</Text>
-            </View>
-            <View style={styles.vitalsRow}>
-              <Text style={styles.vitalsLabel}>SOCIAL SCORE</Text>
-              <Text style={styles.vitalsValue}>{userProfile.socialScore}</Text>
-            </View>
-            <View style={[styles.vitalsRow, styles.vitalsRowLast]}>
-              <Text style={styles.vitalsLabel}>SUPPORT SCORE</Text>
-              <Text style={styles.vitalsValue}>{userProfile.supportScore}</Text>
-            </View>
-          </View>
-        </SpringPressable>
+        <DayStreakCard />
+
+        <DailyQuoteCard />
       </Reanimated.ScrollView>
 
       <AppHeader />
@@ -1357,8 +1683,6 @@ function ChallengesScreen() {
         }}
       />
 
-      <SystemLockModal visible={lockModalVisible} onClose={() => setLockModalVisible(false)} />
-
       <InfoPopupModal
         visible={vitalsModalVisible}
         onClose={() => setVitalsModalVisible(false)}
@@ -1372,7 +1696,8 @@ function ChallengesScreen() {
         <View style={styles.questDivider} />
         <Text style={styles.bodyText}>
           Social Score accumulates via real-world social friction. Every verified quest
-          submission awards +50 Social Score — current total: {userProfile.socialScore}.
+          submission awards +{SOCIAL_SCORE_REWARD} Social Score — current total:{' '}
+          {userProfile.socialScore}.
         </Text>
         <View style={styles.questDivider} />
         <Text style={styles.bodyText}>
@@ -1867,7 +2192,7 @@ function CommunityScreen() {
         contentContainerStyle={[
           styles.screenScroll,
           {
-            paddingTop: insets.top + HEADER_BRAND_HEIGHT + LIVE_TICKER_HEIGHT + 16,
+            paddingTop: insets.top + HEADER_BRAND_HEIGHT + 16,
             paddingBottom: insets.bottom + 80 + 140,
           },
         ]}
@@ -2110,7 +2435,7 @@ function ProfileScreen() {
         contentContainerStyle={[
           styles.screenScroll,
           {
-            paddingTop: insets.top + HEADER_BRAND_HEIGHT + LIVE_TICKER_HEIGHT + 16,
+            paddingTop: insets.top + HEADER_BRAND_HEIGHT + 16,
             paddingBottom: insets.bottom + 80 + 140,
           },
         ]}
@@ -2226,7 +2551,7 @@ function ProfileScreen() {
       >
         <Text style={styles.bodyText}>
           Points accumulated via real-world social friction. Every verified quest submission
-          awards +50 Social Score — current total: {userProfile.socialScore}.
+          awards +{SOCIAL_SCORE_REWARD} Social Score — current total: {userProfile.socialScore}.
         </Text>
       </InfoPopupModal>
 
@@ -2246,26 +2571,171 @@ function ProfileScreen() {
 }
 
 // ============================================================================
+// TAB 2 — PROGRESS (GROWTH ANALYTICS & COMPLETION ARCHIVE)
+// New tab. Reads exclusively from existing state — live scores, streak,
+// level, journal completion logs, and broadcast posts. Also hosts the
+// System Lock status card/modal (relocated from Home) so that feature is
+// preserved. No new mechanics introduced.
+// ============================================================================
+
+function ProgressScreen() {
+  const insets = useSafeAreaInsets();
+  const { userProfile, userJournals, communityFeed } = useAppContext();
+  const [lockModalVisible, setLockModalVisible] = useState(false);
+
+  const socialRatio = userProfile.socialScore / MAX_SOCIAL_SCORE;
+  const supportRatio = userProfile.supportScore / MAX_SUPPORT_SCORE;
+  const broadcastCount = communityFeed.filter(
+    (post) => post.handle === userProfile.handle,
+  ).length;
+
+  const scrollY = useSharedValue(0);
+  const onScroll = useAnimatedScrollHandler((event) => {
+    scrollY.value = event.contentOffset.y;
+  });
+
+  return (
+    <View style={styles.screenRoot}>
+      <Starfield scrollY={scrollY} />
+      <Reanimated.ScrollView
+        onScroll={onScroll}
+        scrollEventThrottle={16}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        contentContainerStyle={[
+          styles.screenScroll,
+          {
+            paddingTop: insets.top + HEADER_BRAND_HEIGHT + 16,
+            paddingBottom: insets.bottom + 80 + 140,
+          },
+        ]}
+        showsVerticalScrollIndicator={false}
+      >
+        <SectionHeader label="GROWTH ANALYTICS" />
+        <View style={[styles.card, styles.growthCard]}>
+          <View style={styles.progressMetricHeaderRow}>
+            <Text style={styles.growthMetricLabel}>SOCIAL GROWTH</Text>
+            <Text style={styles.progressMetricValue}>
+              {userProfile.socialScore}
+              <Text style={styles.growthMetricMax}> / {MAX_SOCIAL_SCORE}</Text>
+            </Text>
+          </View>
+          <ProgressBar ratio={socialRatio} />
+          <Text style={styles.progressMetricPct}>{Math.round(socialRatio * 100)}% to next tier</Text>
+
+          <View style={styles.progressMetricDivider} />
+
+          <View style={styles.progressMetricHeaderRow}>
+            <Text style={styles.growthMetricLabel}>SUPPORT GROWTH</Text>
+            <Text style={styles.progressMetricValue}>
+              {userProfile.supportScore}
+              <Text style={styles.growthMetricMax}> / {MAX_SUPPORT_SCORE}</Text>
+            </Text>
+          </View>
+          <ProgressBar ratio={supportRatio} />
+          <Text style={styles.progressMetricPct}>{Math.round(supportRatio * 100)}% to next tier</Text>
+        </View>
+
+        <SectionHeader label="MILESTONES" />
+        <View style={styles.card}>
+          <View style={styles.vitalsRow}>
+            <Text style={styles.vitalsLabel}>GROWTH STAGE</Text>
+            <Text style={styles.vitalsValue}>
+              {userProfile.level} — {getStageTitle(userProfile.level).toUpperCase()}
+            </Text>
+          </View>
+          <View style={styles.vitalsRow}>
+            <Text style={styles.vitalsLabel}>UNBROKEN STREAK</Text>
+            <Text style={styles.vitalsValue}>{userProfile.streak} DAYS</Text>
+          </View>
+          <View style={styles.vitalsRow}>
+            <Text style={styles.vitalsLabel}>QUESTS COMPLETED</Text>
+            <Text style={styles.vitalsValue}>{userJournals.length}</Text>
+          </View>
+          <View style={[styles.vitalsRow, styles.vitalsRowLast]}>
+            <Text style={styles.vitalsLabel}>REPORTS BROADCAST</Text>
+            <Text style={styles.vitalsValue}>{broadcastCount}</Text>
+          </View>
+        </View>
+
+        <SystemLockPreviewCard
+          onPress={() => {
+            triggerHaptic();
+            setLockModalVisible(true);
+          }}
+        />
+
+        <SectionHeader label="COMPLETED QUEST ARCHIVE" />
+        {userJournals.length === 0 ? (
+          <View style={styles.card}>
+            <Text style={styles.bodyText}>
+              No completed quests logged yet. Clear a challenge to start your archive.
+            </Text>
+          </View>
+        ) : (
+          userJournals.map((entry) => (
+            <View key={entry.id} style={styles.card}>
+              <View style={styles.journalMetaRow}>
+                <Text style={styles.journalDate}>{entry.date}</Text>
+                <Text style={styles.journalTier}>LEVEL {entry.level}</Text>
+              </View>
+              <View style={styles.growthDivider} />
+              <Text style={styles.bodyText} numberOfLines={3} ellipsizeMode="tail">
+                {entry.text}
+              </Text>
+            </View>
+          ))
+        )}
+      </Reanimated.ScrollView>
+
+      <AppHeader />
+
+      <SystemLockModal visible={lockModalVisible} onClose={() => setLockModalVisible(false)} />
+    </View>
+  );
+}
+
+// ============================================================================
 // SECTION 4 — NAVIGATION SHELL (CUSTOM BOTTOM TABS)
 // ============================================================================
 
 type RootTabParamList = {
   Challenges: undefined;
+  Progress: undefined;
   Community: undefined;
   Profile: undefined;
 };
 
 const Tab = createBottomTabNavigator<RootTabParamList>();
 
+// Monochrome, tintable unicode glyphs so the active tab can render in
+// high-voltage neon green while inactive tabs stay muted sage.
 const TAB_GLYPHS: Record<keyof RootTabParamList, string> = {
-  Challenges: '\u25CE', // ◎
-  Community: '\u25A4', // ▤
-  Profile: '\u25A3', // ▣
+  Challenges: '\u2302', // ⌂ home
+  Progress: '\u2637', // ☷ analytics bars
+  Community: '\u25A4', // ▤ community
+  Profile: '\u25A3', // ▣ profile
+};
+
+const TAB_LABELS: Record<keyof RootTabParamList, string> = {
+  Challenges: 'Home',
+  Progress: 'Progress',
+  Community: 'Community',
+  Profile: 'Profile',
 };
 
 function TabIcon({ glyph, focused }: { glyph: string; focused: boolean }) {
+  return <Text style={[styles.tabIcon, focused && styles.tabIconFocused]}>{glyph}</Text>;
+}
+
+function TabLabel({ label, focused }: { label: string; focused: boolean }) {
   return (
-    <Text style={[styles.tabIcon, focused && styles.tabIconFocused]}>{glyph}</Text>
+    <View style={styles.tabLabelWrap}>
+      <Text style={[styles.tabLabel, focused && styles.tabLabelFocused]} numberOfLines={1}>
+        {label}
+      </Text>
+      <View style={[styles.tabDot, focused && styles.tabDotActive]} />
+    </View>
   );
 }
 
@@ -2300,13 +2770,6 @@ function RootTabs() {
           paddingBottom: Math.max(insets.bottom, 8),
           elevation: 12,
         },
-        tabBarLabelStyle: {
-          fontFamily: MONO,
-          fontSize: 10,
-          fontWeight: '700',
-          letterSpacing: 1.5,
-          textTransform: 'uppercase',
-        },
         tabBarItemStyle: {
           minHeight: 48,
           minWidth: 48,
@@ -2314,23 +2777,15 @@ function RootTabs() {
         tabBarIcon: ({ focused }) => (
           <TabIcon glyph={TAB_GLYPHS[route.name]} focused={focused} />
         ),
+        tabBarLabel: ({ focused }) => (
+          <TabLabel label={TAB_LABELS[route.name]} focused={focused} />
+        ),
       })}
     >
-      <Tab.Screen
-        name="Challenges"
-        component={ChallengesScreen}
-        options={{ tabBarLabel: 'CHALLENGES' }}
-      />
-      <Tab.Screen
-        name="Community"
-        component={CommunityScreen}
-        options={{ tabBarLabel: 'COMMUNITY' }}
-      />
-      <Tab.Screen
-        name="Profile"
-        component={ProfileScreen}
-        options={{ tabBarLabel: 'PROFILE' }}
-      />
+      <Tab.Screen name="Challenges" component={ChallengesScreen} />
+      <Tab.Screen name="Progress" component={ProgressScreen} />
+      <Tab.Screen name="Community" component={CommunityScreen} />
+      <Tab.Screen name="Profile" component={ProfileScreen} />
     </Tab.Navigator>
   );
 }
@@ -2385,14 +2840,42 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   brandWordmark: {
-    fontFamily: SANS,
+    fontFamily: DISPLAY,
     color: COLORS.body,
-    fontSize: 20,
+    fontSize: 22,
     fontWeight: '900',
-    letterSpacing: 4,
+    letterSpacing: 1,
   },
   brandAccent: {
     color: COLORS.neon,
+  },
+
+  // ---- header status pills (flame streak + chat notifications) ---------------
+  headerBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  headerPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    boxShadow: '0 0 14px rgba(0, 255, 102, 0.12)',
+  },
+  headerPillGlyph: {
+    fontSize: 13,
+  },
+  headerPillNumber: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 14,
+    fontWeight: '800',
   },
   headerStreakBadge: {
     flexDirection: 'row',
@@ -2591,15 +3074,15 @@ const styles = StyleSheet.create({
 
   // ---- cards (glassmorphism + razor-thin neon tactical borders) ---------------
   card: {
-    backgroundColor: 'rgba(22, 32, 26, 0.72)',
+    backgroundColor: COLORS.elevated,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 18,
+    borderRadius: 20,
     padding: 18,
-    marginBottom: 16,
+    marginBottom: 14,
   },
   cardAccent: {
-    boxShadow: '0 0 24px rgba(0, 230, 118, 0.10)',
+    boxShadow: '0 0 24px rgba(0, 255, 102, 0.10)',
   },
   cardPressed: {
     opacity: 0.85,
@@ -3341,12 +3824,384 @@ const styles = StyleSheet.create({
     paddingVertical: 20,
   },
 
-  // ---- tab bar icons ------------------------------------------------------------------------
+  // ---- tab bar icons + labels + active dot --------------------------------------------------
   tabIcon: {
-    fontSize: 20,
+    fontSize: 22,
     color: COLORS.muted,
   },
   tabIconFocused: {
     color: COLORS.neon,
+  },
+  tabLabelWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  tabLabel: {
+    fontFamily: DISPLAY,
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: '600',
+    letterSpacing: 0.2,
+  },
+  tabLabelFocused: {
+    color: COLORS.neon,
+    fontWeight: '700',
+  },
+  tabDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 2.5,
+    marginTop: 3,
+    backgroundColor: 'transparent',
+  },
+  tabDotActive: {
+    backgroundColor: COLORS.neon,
+    boxShadow: '0 0 8px rgba(0, 255, 102, 0.85)',
+  },
+
+  // ---- determinate progress bar (Home + Progress) -------------------------------------------
+  progressTrack: {
+    width: '100%',
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: COLORS.disabled,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 4,
+    backgroundColor: COLORS.neon,
+    boxShadow: '0 0 10px rgba(0, 255, 102, 0.5)',
+  },
+
+  // ---- Home: Growth Stage card --------------------------------------------------------------
+  growthCard: {
+    padding: 18,
+  },
+  growthTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  growthRingGlyph: {
+    fontSize: 26,
+  },
+  growthTopText: {
+    flex: 1,
+    marginLeft: 14,
+  },
+  growthLabel: {
+    fontFamily: DISPLAY,
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
+    marginBottom: 2,
+  },
+  growthNumber: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 34,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+    lineHeight: 38,
+  },
+  growthStageTitle: {
+    fontFamily: DISPLAY,
+    color: COLORS.neon,
+    fontSize: 15,
+    fontWeight: '700',
+    letterSpacing: -0.3,
+    marginTop: 2,
+  },
+  growthMotivation: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  growthChevron: {
+    color: COLORS.neon,
+    fontSize: 22,
+    fontWeight: '800',
+    marginLeft: 8,
+  },
+  growthDivider: {
+    height: 1,
+    backgroundColor: COLORS.divider,
+    marginVertical: 16,
+  },
+  growthBottomRow: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  growthMetricCol: {
+    flex: 1,
+  },
+  growthMetricLabel: {
+    fontFamily: DISPLAY,
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  growthMetricValue: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 17,
+    fontWeight: '800',
+    letterSpacing: -0.3,
+    marginBottom: 8,
+  },
+  growthMetricMax: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  growthMetricPct: {
+    fontFamily: SANS,
+    color: COLORS.neon,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 6,
+  },
+
+  // ---- Home: Today's Challenge hero card ----------------------------------------------------
+  challengeCard: {
+    borderColor: 'rgba(0, 255, 102, 0.28)',
+    boxShadow: '0 0 30px rgba(0, 255, 102, 0.10)',
+  },
+  challengeKicker: {
+    fontFamily: DISPLAY,
+    color: COLORS.neon,
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+    marginBottom: 12,
+  },
+  challengeBodyRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  challengeTextBlock: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  challengeTitle: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+    lineHeight: 27,
+    marginBottom: 8,
+  },
+  challengeDesc: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  challengeGlowCircle: {
+    width: 76,
+    height: 76,
+    borderRadius: 38,
+    backgroundColor: 'rgba(0, 255, 102, 0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 255, 102, 0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxShadow: '0 0 28px rgba(0, 255, 102, 0.5)',
+  },
+  challengeGlowGlyph: {
+    fontSize: 30,
+  },
+  challengeBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 16,
+    marginBottom: 16,
+  },
+  difficultyPill: {
+    backgroundColor: 'rgba(0, 255, 102, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 255, 102, 0.35)',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  difficultyPillText: {
+    fontFamily: DISPLAY,
+    color: COLORS.neon,
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
+  challengeReward: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  acceptButton: {
+    flexDirection: 'row',
+    minHeight: 54,
+    backgroundColor: COLORS.neon,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    paddingHorizontal: 20,
+    boxShadow: '0 0 26px rgba(0, 255, 102, 0.4)',
+  },
+  acceptButtonPressed: {
+    backgroundColor: COLORS.emerald,
+  },
+  acceptButtonStandalone: {
+    marginTop: 4,
+    marginBottom: 16,
+  },
+  acceptButtonText: {
+    fontFamily: DISPLAY,
+    color: COLORS.onNeon,
+    fontSize: 15,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
+  acceptButtonArrow: {
+    color: COLORS.onNeon,
+    fontSize: 18,
+    fontWeight: '800',
+  },
+
+  // ---- Home: Day Streak tracker -------------------------------------------------------------
+  streakCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  streakLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  streakFlame: {
+    fontSize: 28,
+  },
+  streakNumber: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 26,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+    lineHeight: 28,
+  },
+  streakCaption: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  streakDays: {
+    flexDirection: 'row',
+    gap: 4,
+  },
+  dayCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.disabled,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dayCircleDone: {
+    backgroundColor: COLORS.neon,
+    borderColor: COLORS.neon,
+    boxShadow: '0 0 10px rgba(0, 255, 102, 0.5)',
+  },
+  dayCircleText: {
+    fontFamily: DISPLAY,
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  dayCircleTextDone: {
+    color: COLORS.onNeon,
+  },
+
+  // ---- Home: Daily Quote card ---------------------------------------------------------------
+  quoteCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  quoteLeafCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(0, 255, 102, 0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 255, 102, 0.3)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  quoteLeafGlyph: {
+    fontSize: 20,
+  },
+  quoteTextBlock: {
+    flex: 1,
+    paddingRight: 8,
+  },
+  quoteText: {
+    fontFamily: SANS,
+    color: COLORS.body,
+    fontSize: 13,
+    fontStyle: 'italic',
+    lineHeight: 19,
+  },
+  quoteAuthor: {
+    fontFamily: SANS,
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 4,
+  },
+  quoteMountain: {
+    fontSize: 26,
+    marginLeft: 4,
+  },
+
+  // ---- Progress tab metrics -----------------------------------------------------------------
+  progressMetricHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  progressMetricValue: {
+    fontFamily: DISPLAY,
+    color: COLORS.body,
+    fontSize: 15,
+    fontWeight: '800',
+    letterSpacing: -0.3,
+  },
+  progressMetricPct: {
+    fontFamily: SANS,
+    color: COLORS.neon,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 8,
+  },
+  progressMetricDivider: {
+    height: 1,
+    backgroundColor: COLORS.divider,
+    marginVertical: 18,
   },
 });
