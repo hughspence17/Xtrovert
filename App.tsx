@@ -54,6 +54,7 @@ import {
     SafeAreaProvider,
     useSafeAreaInsets,
 } from 'react-native-safe-area-context';
+import { AuthProvider } from './lib/AuthProvider';
 
 // ============================================================================
 // SECTION 1 — DESIGN TOKENS ("TACTICAL GREEN" SYSTEM)
@@ -2797,12 +2798,14 @@ function RootTabs() {
 export default function App() {
   return (
     <SafeAreaProvider>
-      <AppProvider>
-        <NavigationContainer theme={navTheme}>
-          <StatusBar style="light" />
-          <RootTabs />
-        </NavigationContainer>
-      </AppProvider>
+      <AuthProvider>
+        <AppProvider>
+          <NavigationContainer theme={navTheme}>
+            <StatusBar style="light" />
+            <RootTabs />
+          </NavigationContainer>
+        </AppProvider>
+      </AuthProvider>
     </SafeAreaProvider>
   );
 }
