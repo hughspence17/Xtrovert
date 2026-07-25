@@ -1,13 +1,13 @@
-import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
 import type { AuthChangeEvent, Session, User } from '@supabase/supabase-js';
+import React, {
+    createContext,
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
 import { supabase } from './supabase';
 
 /**
@@ -38,6 +38,12 @@ export type AuthContextValue = {
   refreshSession: () => Promise<void>;
   /** Clear the active session. Does NOT auto-mint a new anonymous user. */
   signOut: () => Promise<void>;
+  /**
+   * Dev/QA only: sign in with a permanent email+password account (e.g. a
+   * test operator created in the Supabase dashboard). Never used by any
+   * production UI path — only the __DEV__-gated test panel calls this.
+   */
+  signInWithPassword: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -188,6 +194,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const signInWithPassword = useCallback(async (email: string, password: string) => {
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+      if (signInError) {
+        throw signInError;
+      }
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Sign-in failed';
+      console.error('[Auth] signInWithPassword failed:', message);
+      return { ok: false, error: message };
+    }
+  }, []);
+
   const value = useMemo<AuthContextValue>(() => {
     const user = session?.user ?? null;
     const isAnonymous = Boolean(user?.is_anonymous);
@@ -204,8 +224,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       error,
       refreshSession,
       signOut,
+      signInWithPassword,
     };
-  }, [session, isLoading, error, refreshSession, signOut]);
+  }, [session, isLoading, error, refreshSession, signOut, signInWithPassword]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

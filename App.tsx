@@ -10,6 +10,13 @@ import {
 } from '@react-navigation/bottom-tabs';
 import { DarkTheme, NavigationContainer, useNavigation } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
+import { useFonts } from 'expo-font';
+import {
+  DMSans_400Regular,
+  DMSans_600SemiBold,
+  DMSans_700Bold,
+  DMSans_800ExtraBold,
+} from '@expo-google-fonts/dm-sans';
 import { StatusBar } from 'expo-status-bar';
 import React, {
     createContext,
@@ -54,7 +61,45 @@ import {
     SafeAreaProvider,
     useSafeAreaInsets,
 } from 'react-native-safe-area-context';
-import { AuthProvider } from './lib/AuthProvider';
+import { AuthProvider, useAuth } from './lib/AuthProvider';
+import { ProfileProvider, useProfile } from './lib/ProfileProvider';
+import {
+  fetchNextChallenge,
+  completeChallenge,
+  fetchCompletedChallengeCount,
+} from './lib/challenges';
+import { fetchJournalEntries, addJournalEntry } from './lib/journal';
+import { fetchDailyQuote } from './lib/quotes';
+import { fetchStreakWeek, computeWeekMarks } from './lib/streak';
+import {
+  fetchCommunityFeed,
+  togglePostLike,
+  fetchReplies,
+  addReply as addReplyDb,
+  incrementPostView,
+  reportContent,
+  blockUser,
+  fetchBlockedIds,
+  createStandalonePost,
+} from './lib/community';
+import {
+  findOrCreateConversation,
+  createGroupConversation,
+  fetchKnownUsers,
+  fetchConversations,
+  fetchMessages,
+  sendMessage,
+  subscribeToMessages,
+} from './lib/messaging';
+import type {
+  ChallengeRow,
+  CommunityPostRow,
+  PostReplyRow,
+  ConversationSummary,
+  ConversationMemberLite,
+  MessageRow,
+} from './lib/schema';
+import { REPORT_REASONS } from './lib/schema';
 
 // ============================================================================
 // SECTION 1 — DESIGN TOKENS ("TACTICAL GREEN" SYSTEM)
@@ -108,6 +153,13 @@ const DISPLAY = Platform.select({
   default: 'System',
 });
 
+// DM Sans family names (loaded at runtime in the App root via useFonts).
+// Applied to the Phase 2 dynamic profile text nodes per the typography spec.
+const DM_SANS = 'DMSans_400Regular';
+const DM_SANS_SEMI = 'DMSans_600SemiBold';
+const DM_SANS_BOLD = 'DMSans_700Bold';
+const DM_SANS_HEAVY = 'DMSans_800ExtraBold';
+
 // Height of the fixed header's brand row (XTROVERT wordmark + status pills).
 const HEADER_BRAND_HEIGHT = 56;
 
@@ -117,19 +169,26 @@ const HEADER_BRAND_HEIGHT = 56;
 // overlaps or blocks core UI elements.
 const LIVE_TICKER_HEIGHT = 30;
 
-// Flat reward applied to a user's Support Score whenever they reply to
-// someone else's community post.
-const SUPPORT_SCORE_REWARD = 10;
+// Flat Social Score reward applied whenever a user replies to someone else's
+// community post (community support now feeds the single Social Score metric).
+const REPLY_SCORE_REWARD = 10;
 
 // Flat reward applied to a user's Social Score for every verified quest
 // submission. Bound to both the award logic and the challenge XP label so
 // the two can never drift out of sync.
 const SOCIAL_SCORE_REWARD = 50;
 
-// Ceilings used to render the Social/Support "growth" progress bars and
-// percentages on the Home and Progress screens.
-const MAX_SOCIAL_SCORE = 1000;
-const MAX_SUPPORT_SCORE = 1000;
+// Mirrors public.ranks.xp_required — the Social Growth progress bar/fraction
+// on Home and Progress reads the *next* rank's threshold from this map
+// (never a fixed ceiling), so it stays meaningful at every rank instead of
+// flatlining once social_score exceeds an arbitrary constant.
+const RANK_XP_REQUIRED: Record<string, number> = {
+  Starter: 0,
+  Bronze: 100,
+  Silver: 500,
+  Gold: 1500,
+  Platinum: 4000,
+};
 
 // Page size used for the Journal archive's infinite scroll — both the
 // initial page and every subsequent `onEndReached` load.
@@ -149,58 +208,41 @@ function triggerHaptic() {
 // TYPES
 // ============================================================================
 
-interface UserProfile {
-  handle: string;
-  level: number;
-  socialScore: number;
-  supportScore: number;
-  streak: number;
-  // ISO date (YYYY-MM-DD) of the last day a challenge was completed. Used to
-  // gate streak increments to once-per-calendar-day.
-  lastCompletedDate: string | null;
-}
-
-interface Quest {
+// The active challenge surfaced on Home, sourced from public.challenges.
+interface ActiveChallenge {
   id: string;
-  level: number;
   title: string;
   instructions: string;
+  requiredRank: string | null;
+  xpReward: number;
+  difficulty: string;
 }
 
-interface Reply {
+// A community post joined with its author identity (public.community_posts +
+// public.profiles) plus live engagement counters.
+interface CommunityPost {
   id: string;
-  handle: string;
-  text: string;
-  timestamp: string;
-  likeCount: number;
-  liked: boolean;
-  profilePictureUrl?: string | null;
-}
-
-interface FeedPost {
-  id: string;
-  handle: string;
-  level: number;
+  userId: string;
+  authorUsername: string;
+  authorRank: string;
+  authorBio: string;
   title: string;
   body: string;
-  timestamp: string;
-  socialScore: number;
-  supportScore: number;
+  createdAt: string;
   viewCount: number;
-  // User IDs (here, operator handles) that have already registered a view
-  // on this post, so repeat opens by the same user never inflate viewCount.
-  viewedBy: string[];
   likeCount: number;
+  replyCount: number;
   liked: boolean;
-  profilePictureUrl?: string | null;
-  replies: Reply[];
+  journalEntryId: string | null;
 }
 
-interface JournalEntry {
+// A private journal entry (public.journal_entries) for the Home journal feed.
+interface JournalItem {
   id: string;
-  date: string;
-  level: number;
-  text: string;
+  title: string | null;
+  challengeTitle: string | null;
+  content: string;
+  createdAt: string;
 }
 
 interface DailyQuote {
@@ -209,207 +251,48 @@ interface DailyQuote {
 }
 
 interface AppContextShape {
-  userProfile: UserProfile;
-  activeQuest: Quest;
-  communityFeed: FeedPost[];
-  userJournals: JournalEntry[];
-  dailyQuote: DailyQuote;
-  submitVerification: (text: string, broadcast: boolean) => void;
-  loadNextChallenge: () => void;
-  addReply: (postId: string, text: string) => void;
-  addStandalonePost: (title: string, body: string) => void;
-  toggleLike: (postId: string) => void;
-  toggleReplyLike: (postId: string, replyId: string) => void;
-  registerPostView: (postId: string, viewerId: string) => void;
+  // Challenge flow (Steps 1-3)
+  activeChallenge: ActiveChallenge | null;
+  challengeLoading: boolean;
+  challengeCompleted: boolean;
+  lastAwardedXp: number;
+  submitChallenge: (
+    text: string,
+    broadcast: boolean,
+    postTitle: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  loadNextChallenge: () => Promise<void>;
+  resetCompletedFlag: () => void;
+  // Personal journal (Step 4)
+  journalEntries: JournalItem[];
+  journalLoading: boolean;
+  refreshJournal: () => Promise<void>;
+  addPersonalJournalEntry: (content: string, title?: string) => Promise<{ ok: boolean; error?: string }>;
+  // Community + moderation (Step 5)
+  communityFeed: CommunityPost[];
+  feedLoading: boolean;
+  refreshFeed: () => Promise<void>;
+  likePost: (postId: string) => Promise<void>;
+  reportPost: (postId: string, reportedUserId: string, reason: string) => Promise<boolean>;
+  blockAuthor: (blockedId: string) => Promise<void>;
+  registerView: (postId: string) => Promise<void>;
+  createPost: (title: string, body: string) => Promise<boolean>;
+  setReplyCount: (postId: string, count: number) => void;
+  // Progress (Step 6)
+  completedCount: number;
+  dailyQuote: DailyQuote | null;
+  dailyQuoteLoading: boolean;
+  // Weekly streak tracker (real per-day history, not a synthetic guess)
+  streakWeek: Set<string>;
 }
 
 // ============================================================================
 // SECTION 2 — INITIAL SEED MOCK DATA
 // ============================================================================
 
-const QUEST_POOL: Quest[] = [
-  {
-    id: 'quest-001',
-    level: 5,
-    title: 'THE CUSTOM ORDER',
-    instructions:
-      'Ask a barista for their personal drink recommendation and order it without hesitating or changing your mind.',
-  },
-  {
-    id: 'quest-002',
-    level: 5,
-    title: 'THE COLD GREETING',
-    instructions:
-      'Make direct eye contact and say a genuine "good morning" to three strangers you pass on the street.',
-  },
-  {
-    id: 'quest-003',
-    level: 5,
-    title: 'THE HONEST OPINION',
-    instructions:
-      'In your next group conversation, voice a genuine opinion that mildly disagrees with the consensus — calmly, and without apologizing for it.',
-  },
-  {
-    id: 'quest-004',
-    level: 5,
-    title: 'THE COLD CALL',
-    instructions:
-      'Call a real business — a restaurant, a barbershop, a clinic — to ask a question instead of looking the answer up online.',
-  },
-];
-
-const SEED_FEED: FeedPost[] = [
-  {
-    id: 'feed-001',
-    handle: '@Alex_Grit',
-    level: 7,
-    title: 'Overcoming Gym Approach Friction',
-    body:
-      'Saw the same guy repping 315 on bench for three weeks straight. Every session I told myself I would ask him for a spot check on my form and every session I bailed. Tonight I walked over mid-rest, heart hammering like I was about to fight him, and just said it plainly: "Your setup is dialed. Mind checking my arch?" He spent ten minutes coaching me. The anxiety was a complete phantom. The rep was in my head, not in the room.',
-    timestamp: '2h ago',
-    socialScore: 840,
-    supportScore: 610,
-    viewCount: 412,
-    viewedBy: [],
-    likeCount: 58,
-    liked: false,
-    replies: [
-      {
-        id: 'reply-001',
-        handle: '@David_Grit',
-        text: 'This is exactly the kind of rep that compounds. Proud of you for making the ask instead of just admiring from across the gym.',
-        timestamp: '1h ago',
-        likeCount: 6,
-        liked: false,
-      },
-    ],
-  },
-  {
-    id: 'feed-002',
-    handle: '@Marcus_V',
-    level: 4,
-    title: 'Coffee Order — Full Eye Contact Protocol',
-    body:
-      'Mission was to order my entire coffee without breaking eye contact once. Sounds trivial. It is not. My default is to stare at the menu board or my shoes the second another human looks at me. I held the barista\u2019s gaze through the whole order, the payment, and the thank-you. Voice stayed level. She didn\u2019t recoil or think I was strange — she just took the order like a normal interaction, because it WAS a normal interaction. Logging this so future me remembers: nobody is scrutinizing you. Nobody.',
-    timestamp: '5h ago',
-    socialScore: 512,
-    supportScore: 388,
-    viewCount: 203,
-    viewedBy: [],
-    likeCount: 21,
-    liked: false,
-    replies: [],
-  },
-  {
-    id: 'feed-003',
-    handle: '@David_Grit',
-    level: 8,
-    title: 'Spoke First in the Monday Standup',
-    body:
-      'Twenty-one days unbroken. Today\u2019s rep: be the first voice in the crowded Monday meeting instead of hiding in the back praying nobody calls on me. I opened with the sprint blocker before anyone else spoke. Hands were sweating under the table but my voice came out flat and clear. My manager followed up with me after — first time he has ever done that. Visibility compounds. Silence also compounds. Choose which one you are stacking.',
-    timestamp: '9h ago',
-    socialScore: 1120,
-    supportScore: 764,
-    viewCount: 589,
-    viewedBy: [],
-    likeCount: 74,
-    liked: false,
-    replies: [
-      {
-        id: 'reply-002',
-        handle: '@Alex_Grit',
-        text: '21 days is no joke. The fact you spoke first before anyone else called on you is a completely different nervous system than three weeks ago.',
-        timestamp: '6h ago',
-        likeCount: 9,
-        liked: false,
-      },
-    ],
-  },
-  {
-    id: 'feed-004',
-    handle: '@Rob_Ironside',
-    level: 3,
-    title: 'Asked a Stranger for Directions — No Phone Crutch',
-    body:
-      'Level 3 protocol: navigate downtown without GPS, ask real humans for directions minimum three times. First ask was brutal — I rehearsed the sentence four times before approaching an older guy at a bus stop. He was completely friendly. Second and third asks took zero rehearsal. The friction curve collapses fast when you actually load the bar. Three months ago I would have walked forty minutes in the wrong direction before speaking to a stranger. Grid works if you work it.',
-    timestamp: '14h ago',
-    socialScore: 290,
-    supportScore: 205,
-    viewCount: 156,
-    viewedBy: [],
-    likeCount: 14,
-    liked: false,
-    replies: [],
-  },
-  {
-    id: 'feed-005',
-    handle: '@Sam_Forge',
-    level: 6,
-    title: 'Returned a Wrong Order Without Apologizing Once',
-    body:
-      'They brought me the wrong dish. Old me eats it quietly and leaves a tip on top, furious at myself for a week. Tonight I flagged the waiter, stated the mix-up in one plain sentence, zero apologies, zero nervous laughter, and asked for the correct order. He fixed it in five minutes and comped the drink. Total emotional damage: none. The catastrophic social explosion my brain promised me for thirty years simply does not exist. It never existed.',
-    timestamp: '1d ago',
-    socialScore: 678,
-    supportScore: 540,
-    viewCount: 298,
-    viewedBy: [],
-    likeCount: 33,
-    liked: false,
-    replies: [],
-  },
-];
-
-const SEED_JOURNALS: JournalEntry[] = [
-  {
-    id: 'journal-003',
-    date: '10 JUL 2026',
-    level: 4,
-    text:
-      'Complimented a stranger\u2019s watch at the gas station and held the follow-up small talk for a full minute without exit-seeking. Voice cracked on the opener but I stayed planted. He ended up recommending a watch forum. Net positive interaction from pure cold approach.',
-  },
-  {
-    id: 'journal-002',
-    date: '09 JUL 2026',
-    level: 4,
-    text:
-      'Called the dentist to reschedule instead of using the app like a coward. Phone calls are my weakest vector. Receptionist was neutral-friendly, call lasted ninety seconds, and the dread I carried for two days evaporated in the first five seconds of dialing.',
-  },
-  {
-    id: 'journal-001',
-    date: '08 JUL 2026',
-    level: 3,
-    text:
-      'Sat in the middle of the food court instead of the corner wall seat. Ate the entire meal without pulling my phone out as a shield. Noticed nobody looked at me even once. The audience I perform avoidance for does not attend the show.',
-  },
-  {
-    id: 'journal-000a',
-    date: '07 JUL 2026',
-    level: 3,
-    text:
-      'Asked a coworker to actually explain a process instead of nodding along and pretending to understand. Old me would rather struggle silently for a week than admit confusion out loud. She explained it in ninety seconds flat.',
-  },
-  {
-    id: 'journal-000b',
-    date: '06 JUL 2026',
-    level: 3,
-    text:
-      'Voiced a scheduling conflict in the group chat instead of just going along with a time that did not work for me. Nobody pushed back or got annoyed. The confrontation I imagined in my head simply did not happen.',
-  },
-  {
-    id: 'journal-000c',
-    date: '05 JUL 2026',
-    level: 2,
-    text:
-      'Sent a message correcting a mistake in a group plan instead of silently going along with the wrong plan. Felt like a huge confrontation in my head, read as a completely normal clarification to everyone else in the thread.',
-  },
-  {
-    id: 'journal-000d',
-    date: '04 JUL 2026',
-    level: 2,
-    text:
-      'First day of the log. Committed to stop editing every message eleven times before sending. Sent the first draft to a group chat unedited. Nothing happened. The world did not end.',
-  },
-];
+// Quest / feed / journal content now comes live from Supabase (public.challenges,
+// public.community_posts, public.journal_entries). Only presentational pools
+// (ticker, quotes, growth-stage titles) remain seeded below.
 
 // Clean single-bullet format: "[Username] completed a task • [Username] completed a task".
 // No "[system log]" labels, no doubled bullet/space artifacts.
@@ -421,17 +304,11 @@ const TICKER_ITEMS: string[] = [
   '@Rob_Ironside logged a new exposure rep',
 ];
 
-// Daily motivation pool for the Home screen's Daily Quote card. The provider
-// selects one deterministically per calendar day so the quote is dynamic
-// (never a hardcoded JSX string) yet stable across a single day's session.
-const QUOTE_POOL: DailyQuote[] = [
-  { text: 'Growth happens outside your comfort zone.', author: 'Keep showing up' },
-  { text: 'Courage is a muscle. Train it every single day.', author: 'Field Doctrine' },
-  { text: 'The rep is in your head, not in the room.', author: 'Operator Log' },
-  { text: 'Discomfort is just data. Move toward it.', author: 'Keep showing up' },
-  { text: 'You become what you repeatedly dare to do.', author: 'Field Doctrine' },
-  { text: 'Small brave acts compound into a bold life.', author: 'Operator Log' },
-];
+// The Home screen's Daily Quote card now reads live from Supabase
+// (public.daily_quotes via the get_daily_quote() RPC) — see lib/quotes.ts.
+// The table has zero client write grants, so there is no path for a user
+// to inject or alter quotes; it rotates automatically, one per calendar
+// day, computed server-side.
 
 // Ordered growth-stage titles. The user's level indexes into this list so the
 // Home screen's stage subtitle is derived dynamically from live state.
@@ -453,33 +330,55 @@ function getStageTitle(level: number): string {
   return STAGE_TITLES[index];
 }
 
-// Derives a human difficulty label for a quest purely from its level, so the
-// Today's Challenge difficulty pill stays bound to real quest data.
-function getDifficultyLabel(level: number): string {
-  if (level <= 3) return 'Easy';
-  if (level <= 6) return 'Medium';
-  if (level <= 9) return 'Hard';
-  return 'Elite';
+// Ordered rank progression (mirrors public.ranks). Used to derive a numeric
+// "growth stage" and a difficulty label from a rank title.
+const RANK_ORDER = ['Starter', 'Bronze', 'Silver', 'Gold', 'Platinum'];
+
+function rankStage(rankTitle: string | null | undefined): number {
+  const idx = RANK_ORDER.indexOf(rankTitle ?? 'Starter');
+  return (idx < 0 ? 0 : idx) + 1;
 }
 
-// Weekly completion state for the Day Streak tracker, derived from the live
-// streak count. Returns 7 entries (Mon→Sun): 'done' for days covered by the
-// current streak, 'missed' for earlier days this week, 'future' for upcoming.
-type DayState = 'done' | 'missed' | 'future';
-
-function getWeekProgress(streak: number, now: Date = new Date()): DayState[] {
-  const todayIndex = (now.getDay() + 6) % 7; // convert Sun=0..Sat=6 → Mon=0..Sun=6
-  const week: DayState[] = [];
-  for (let i = 0; i < 7; i += 1) {
-    if (i > todayIndex) {
-      week.push('future');
-    } else {
-      const daysAgo = todayIndex - i;
-      week.push(daysAgo < streak ? 'done' : 'missed');
-    }
+// Progress toward the *next* rank's XP threshold — replaces a flat /1000
+// ceiling that made the bar/fraction stop meaning anything above Bronze.
+// At max rank (Platinum) there's no "next" target, so the ring reports full
+// and the fraction shows total score with no denominator.
+function computeRankProgress(
+  rankTitle: string | null | undefined,
+  socialScore: number,
+): { ratio: number; target: number | null } {
+  const idx = RANK_ORDER.indexOf(rankTitle ?? 'Starter');
+  const safeIdx = idx < 0 ? 0 : idx;
+  const nextRank = RANK_ORDER[safeIdx + 1];
+  if (!nextRank) {
+    return { ratio: 1, target: null };
   }
-  return week;
+  const nextThreshold = RANK_XP_REQUIRED[nextRank] ?? Math.max(socialScore, 1);
+  const ratio = nextThreshold > 0 ? Math.min(Math.max(socialScore / nextThreshold, 0), 1) : 1;
+  return { ratio, target: nextThreshold };
 }
+
+const RANK_DIFFICULTY: Record<string, string> = {
+  Starter: 'Easy',
+  Bronze: 'Easy',
+  Silver: 'Medium',
+  Gold: 'Hard',
+  Platinum: 'Elite',
+};
+
+// Difficulty label for a challenge: prefer its own difficulty column, else
+// derive from the rank it requires so the pill always shows real data.
+function difficultyForChallenge(difficulty: string | null, requiredRank: string | null): string {
+  if (difficulty && difficulty.trim().length > 0) return difficulty;
+  if (requiredRank && RANK_DIFFICULTY[requiredRank]) return RANK_DIFFICULTY[requiredRank];
+  return 'Medium';
+}
+
+// Weekly completion marks for the Day Streak tracker now come from real
+// per-day activity history (public.streak_days), not a synthetic guess —
+// see computeWeekMarks() in lib/streak.ts. This correctly renders gaps
+// (e.g. Mon + Wed but not Tue) instead of always drawing a contiguous
+// block ending today.
 
 const WEEKDAY_LABELS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
@@ -513,214 +412,950 @@ function getDateKey(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+function mapChallenge(row: ChallengeRow): ActiveChallenge {
+  return {
+    id: String(row.id),
+    title: String(row.title ?? 'CHALLENGE'),
+    instructions: String(row.description ?? ''),
+    requiredRank: row.required_rank ?? null,
+    xpReward: Number.isFinite(Number(row.xp_reward)) ? Number(row.xp_reward) : 0,
+    difficulty: difficultyForChallenge(row.difficulty, row.required_rank),
+  };
+}
+
+// Usernames are display labels (not identifiers — auth.uid()/profiles.id are
+// the only real identity, joined on everywhere), shown bare with no leading
+// '@'. Kept as a named helper (rather than inlining `String(x)` everywhere)
+// so the single "how do we render a username" decision lives in one place,
+// and so any stray legacy '@'-prefixed value is normalized away.
+function withAt(username: string): string {
+  return username.replace(/^@+/, '');
+}
+
+function mapCommunityPost(row: CommunityPostRow): CommunityPost {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    authorUsername: withAt(row.author_username),
+    authorRank: row.author_rank,
+    authorBio: row.author_bio,
+    title: row.title,
+    body: row.content,
+    createdAt: row.created_at,
+    viewCount: row.view_count,
+    likeCount: row.like_count,
+    replyCount: row.reply_count,
+    liked: row.liked_by_me,
+    journalEntryId: row.journal_entry_id,
+  };
+}
+
 function AppProvider({ children }: { children: React.ReactNode }) {
-  const [userProfile, setUserProfile] = useState<UserProfile>({
-    handle: '@Hugh_Operator',
-    level: 5,
-    socialScore: 450,
-    supportScore: 320,
-    streak: 14,
-    lastCompletedDate: null,
-  });
+  const { user } = useAuth();
+  const { profile, applyProfile } = useProfile();
+  const userId = user?.id ?? null;
+  const rankTitle = profile?.rank_title ?? null;
 
-  const [activeQuestIndex, setActiveQuestIndex] = useState(0);
-  const activeQuest = QUEST_POOL[activeQuestIndex];
+  const [activeChallenge, setActiveChallenge] = useState<ActiveChallenge | null>(null);
+  const [challengeLoading, setChallengeLoading] = useState(true);
+  const [challengeCompleted, setChallengeCompleted] = useState(false);
+  const [lastAwardedXp, setLastAwardedXp] = useState(0);
 
-  const [communityFeed, setCommunityFeed] = useState<FeedPost[]>(SEED_FEED);
-  const [userJournals, setUserJournals] = useState<JournalEntry[]>(SEED_JOURNALS);
+  const [journalEntries, setJournalEntries] = useState<JournalItem[]>([]);
+  const [journalLoading, setJournalLoading] = useState(true);
 
-  // Deterministic per-calendar-day pick from the quote pool. Dynamic (rotates
-  // daily) yet stable for the lifetime of a session, so the Daily Quote card
-  // is never bound to a hardcoded string.
-  const dailyQuote = useMemo<DailyQuote>(() => {
-    const dayNumber = Math.floor(Date.now() / 86_400_000);
-    return QUOTE_POOL[dayNumber % QUOTE_POOL.length];
+  const [communityFeed, setCommunityFeed] = useState<CommunityPost[]>([]);
+  const [feedLoading, setFeedLoading] = useState(true);
+
+  const [completedCount, setCompletedCount] = useState(0);
+
+  const [dailyQuote, setDailyQuote] = useState<DailyQuote | null>(null);
+  const [dailyQuoteLoading, setDailyQuoteLoading] = useState(true);
+
+  const [streakWeek, setStreakWeek] = useState<Set<string>>(new Set());
+
+  // Fetched once per app session — the quote is the same for everyone all
+  // day, so there's nothing gained by re-fetching on every render.
+  useEffect(() => {
+    let mounted = true;
+    setDailyQuoteLoading(true);
+    fetchDailyQuote().then((q) => {
+      if (mounted) {
+        setDailyQuote(q);
+        setDailyQuoteLoading(false);
+      }
+    });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
-  const submitVerification = useCallback(
-    (text: string, broadcast: boolean) => {
-      const now = new Date();
-      const entry: JournalEntry = {
-        id: `journal-${now.getTime()}`,
-        date: formatDateStamp(now),
-        level: activeQuest.level,
-        text,
-      };
-      setUserJournals((prev) => [entry, ...prev]);
+  const loadChallenge = useCallback(async () => {
+    if (!userId) {
+      return;
+    }
+    setChallengeLoading(true);
+    const row = await fetchNextChallenge(userId, rankTitle);
+    setActiveChallenge(row ? mapChallenge(row) : null);
+    setChallengeLoading(false);
+  }, [userId, rankTitle]);
 
-      if (broadcast) {
-        setCommunityFeed((prev) => [
-          {
-            id: `feed-${now.getTime()}`,
-            handle: userProfile.handle,
-            level: userProfile.level,
-            title: `Field Report: ${activeQuest.title}`,
-            body: text,
-            timestamp: 'Just now',
-            socialScore: userProfile.socialScore + 50,
-            supportScore: userProfile.supportScore,
-            viewCount: 0,
-            viewedBy: [],
-            likeCount: 0,
-            liked: false,
-            replies: [],
-          },
-          ...prev,
-        ]);
+  const refreshJournal = useCallback(async () => {
+    if (!userId) {
+      return;
+    }
+    setJournalLoading(true);
+    const rows = await fetchJournalEntries(userId);
+    setJournalEntries(
+      rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        challengeTitle: r.challenge_title,
+        content: r.content,
+        createdAt: r.created_at,
+      })),
+    );
+    setJournalLoading(false);
+  }, [userId]);
+
+  const refreshFeed = useCallback(async () => {
+    if (!userId) {
+      return;
+    }
+    setFeedLoading(true);
+    const rows = await fetchCommunityFeed(userId);
+    setCommunityFeed(rows.map(mapCommunityPost));
+    setFeedLoading(false);
+  }, [userId]);
+
+  const refreshCompletedCount = useCallback(async () => {
+    if (!userId) {
+      return;
+    }
+    setCompletedCount(await fetchCompletedChallengeCount(userId));
+  }, [userId]);
+
+  const refreshStreakWeek = useCallback(async () => {
+    if (!userId) {
+      return;
+    }
+    setStreakWeek(await fetchStreakWeek(userId));
+  }, [userId]);
+
+  // Initial + on-auth data hydration.
+  useEffect(() => {
+    if (!userId) {
+      return;
+    }
+    loadChallenge();
+    refreshJournal();
+    refreshFeed();
+    refreshCompletedCount();
+    refreshStreakWeek();
+  }, [userId, loadChallenge, refreshJournal, refreshFeed, refreshCompletedCount, refreshStreakWeek]);
+
+  const addPersonalJournalEntry = useCallback(async (content: string, title?: string) => {
+    const result = await addJournalEntry(content, title);
+    if (result.ok && result.entry) {
+      const entry = result.entry;
+      setJournalEntries((prev) => [
+        {
+          id: entry.id,
+          title: entry.title,
+          challengeTitle: entry.challenge_title,
+          content: entry.content,
+          createdAt: entry.created_at,
+        },
+        ...prev,
+      ]);
+    }
+    return { ok: result.ok, error: result.error };
+  }, []);
+
+  const setReplyCount = useCallback((postId: string, count: number) => {
+    setCommunityFeed((prev) =>
+      prev.map((post) => (post.id === postId ? { ...post, replyCount: count } : post)),
+    );
+  }, []);
+
+  const submitChallenge = useCallback(
+    async (text: string, broadcast: boolean, postTitle: string) => {
+      if (!activeChallenge || !userId) {
+        return { ok: false };
+      }
+      const result = await completeChallenge({
+        challengeId: activeChallenge.id,
+        journalText: text,
+        broadcast,
+        postTitle: postTitle.trim() || undefined,
+      });
+      if (!result.ok) {
+        return { ok: false, error: result.error };
       }
 
-      const todayKey = getDateKey(now);
-      setUserProfile((prev) => {
-        const alreadyCompletedToday = prev.lastCompletedDate === todayKey;
-        return {
-          ...prev,
-          socialScore: prev.socialScore + SOCIAL_SCORE_REWARD,
-          streak: alreadyCompletedToday ? prev.streak : prev.streak + 1,
-          lastCompletedDate: todayKey,
-        };
-      });
+      setLastAwardedXp(activeChallenge.xpReward);
+      setChallengeCompleted(true);
+
+      // Step 2e: patch useProfile() instantly from the RPC's returned row so
+      // the header streak pill, growth card, and score counters update now.
+      const patch: Partial<{ streak_count: number; social_score: number; rank_title: string }> = {};
+      if (typeof result.streak_count === 'number') patch.streak_count = result.streak_count;
+      if (typeof result.social_score === 'number') patch.social_score = result.social_score;
+      if (typeof result.rank_title === 'string') patch.rank_title = result.rank_title;
+      applyProfile(patch);
+
+      refreshJournal();
+      refreshCompletedCount();
+      refreshStreakWeek();
+      if (broadcast) {
+        refreshFeed();
+      }
+      return { ok: true };
     },
-    [activeQuest, userProfile],
+    [
+      activeChallenge,
+      userId,
+      applyProfile,
+      refreshJournal,
+      refreshCompletedCount,
+      refreshStreakWeek,
+      refreshFeed,
+    ],
   );
 
-  const loadNextChallenge = useCallback(() => {
-    setActiveQuestIndex((prevIndex) => (prevIndex + 1) % QUEST_POOL.length);
-  }, []);
+  const loadNextChallenge = useCallback(async () => {
+    setChallengeCompleted(false);
+    await loadChallenge();
+  }, [loadChallenge]);
 
-  const addReply = useCallback(
-    (postId: string, text: string) => {
-      const targetPost = communityFeed.find((post) => post.id === postId);
-      if (!targetPost) {
+  const resetCompletedFlag = useCallback(() => setChallengeCompleted(false), []);
+
+  const likePost = useCallback(
+    async (postId: string) => {
+      if (!userId) {
         return;
       }
-      const now = new Date();
-      const reply: Reply = {
-        id: `reply-${now.getTime()}`,
-        handle: userProfile.handle,
-        text,
-        timestamp: 'Just now',
-        likeCount: 0,
-        liked: false,
-      };
+      // Optimistic toggle for instant feedback; DB write follows.
       setCommunityFeed((prev) =>
         prev.map((post) =>
-          post.id === postId ? { ...post, replies: [...post.replies, reply] } : post,
+          post.id === postId
+            ? {
+                ...post,
+                liked: !post.liked,
+                likeCount: post.liked ? Math.max(0, post.likeCount - 1) : post.likeCount + 1,
+              }
+            : post,
         ),
       );
-      if (targetPost.handle !== userProfile.handle) {
-        setUserProfile((prev) => ({
-          ...prev,
-          supportScore: prev.supportScore + SUPPORT_SCORE_REWARD,
-        }));
+      await togglePostLike(postId, userId);
+    },
+    [userId],
+  );
+
+  const reportPost = useCallback(
+    async (postId: string, reportedUserId: string, reason: string) => {
+      if (!userId) {
+        return false;
       }
+      return reportContent({ reporterId: userId, reportedUserId, postId, reason });
     },
-    [communityFeed, userProfile.handle],
+    [userId],
   );
 
-  const addStandalonePost = useCallback(
-    (title: string, body: string) => {
-      const now = new Date();
-      const post: FeedPost = {
-        id: `feed-${now.getTime()}`,
-        handle: userProfile.handle,
-        level: userProfile.level,
-        title,
-        body,
-        timestamp: 'Just now',
-        socialScore: userProfile.socialScore,
-        supportScore: userProfile.supportScore,
-        viewCount: 0,
-        viewedBy: [],
-        likeCount: 0,
-        liked: false,
-        replies: [],
-      };
-      setCommunityFeed((prev) => [post, ...prev]);
+  const blockAuthor = useCallback(
+    async (blockedId: string) => {
+      if (!userId) {
+        return;
+      }
+      // Immediately drop their content locally, then persist + re-sync.
+      setCommunityFeed((prev) => prev.filter((post) => post.userId !== blockedId));
+      await blockUser(userId, blockedId);
+      refreshFeed();
     },
-    [userProfile],
+    [userId, refreshFeed],
   );
 
-  const toggleLike = useCallback((postId: string) => {
-    setCommunityFeed((prev) =>
-      prev.map((post) =>
-        post.id === postId
-          ? {
-              ...post,
-              liked: !post.liked,
-              likeCount: post.liked ? post.likeCount - 1 : post.likeCount + 1,
-            }
-          : post,
-      ),
-    );
+  const registerView = useCallback(async (postId: string) => {
+    const count = await incrementPostView(postId);
+    if (count != null) {
+      setCommunityFeed((prev) =>
+        prev.map((post) => (post.id === postId ? { ...post, viewCount: count } : post)),
+      );
+    }
   }, []);
 
-  const toggleReplyLike = useCallback((postId: string, replyId: string) => {
-    setCommunityFeed((prev) =>
-      prev.map((post) => {
-        if (post.id !== postId) {
-          return post;
-        }
-        return {
-          ...post,
-          replies: post.replies.map((reply) =>
-            reply.id === replyId
-              ? {
-                  ...reply,
-                  liked: !reply.liked,
-                  likeCount: reply.liked ? reply.likeCount - 1 : reply.likeCount + 1,
-                }
-              : reply,
-          ),
-        };
-      }),
-    );
-  }, []);
-
-  // Requirement (Point 2): only the first view from a given viewer increments
-  // the counter — repeat opens by the same user never inflate viewCount.
-  const registerPostView = useCallback((postId: string, viewerId: string) => {
-    setCommunityFeed((prev) =>
-      prev.map((post) => {
-        if (post.id !== postId || post.viewedBy.includes(viewerId)) {
-          return post;
-        }
-        return { ...post, viewCount: post.viewCount + 1, viewedBy: [...post.viewedBy, viewerId] };
-      }),
-    );
-  }, []);
+  const createPost = useCallback(
+    async (title: string, body: string) => {
+      if (!userId) {
+        return false;
+      }
+      const ok = await createStandalonePost(userId, title, body);
+      if (ok) {
+        await refreshFeed();
+      }
+      return ok;
+    },
+    [userId, refreshFeed],
+  );
 
   const value = useMemo<AppContextShape>(
     () => ({
-      userProfile,
-      activeQuest,
-      communityFeed,
-      userJournals,
-      dailyQuote,
-      submitVerification,
+      activeChallenge,
+      challengeLoading,
+      challengeCompleted,
+      lastAwardedXp,
+      submitChallenge,
       loadNextChallenge,
-      addReply,
-      addStandalonePost,
-      toggleLike,
-      toggleReplyLike,
-      registerPostView,
+      resetCompletedFlag,
+      journalEntries,
+      journalLoading,
+      refreshJournal,
+      addPersonalJournalEntry,
+      communityFeed,
+      feedLoading,
+      refreshFeed,
+      likePost,
+      reportPost,
+      blockAuthor,
+      registerView,
+      createPost,
+      setReplyCount,
+      completedCount,
+      dailyQuote,
+      dailyQuoteLoading,
+      streakWeek,
     }),
     [
-      userProfile,
-      activeQuest,
-      communityFeed,
-      userJournals,
-      dailyQuote,
-      submitVerification,
+      activeChallenge,
+      challengeLoading,
+      challengeCompleted,
+      lastAwardedXp,
+      submitChallenge,
       loadNextChallenge,
-      addReply,
-      addStandalonePost,
-      toggleLike,
-      toggleReplyLike,
-      registerPostView,
+      resetCompletedFlag,
+      journalEntries,
+      journalLoading,
+      refreshJournal,
+      addPersonalJournalEntry,
+      communityFeed,
+      feedLoading,
+      refreshFeed,
+      likePost,
+      reportPost,
+      blockAuthor,
+      registerView,
+      createPost,
+      setReplyCount,
+      completedCount,
+      dailyQuote,
+      dailyQuoteLoading,
+      streakWeek,
     ],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+}
+
+// ============================================================================
+// SECTION 3B — MESSAGING (gated: opened only from the header pill or the
+// "Message" button on another operator's profile — never a bottom tab).
+// ============================================================================
+
+type ChatTarget = {
+  conversationId: string;
+  isGroup: boolean;
+  title: string | null;
+  /** All other participants (length 1 for a 1:1 chat, 1+ for a group). */
+  members: ConversationMemberLite[];
+  // Convenience accessors for the common 1:1 case.
+  otherUserId: string;
+  otherUsername: string;
+  otherRank: string | null;
+};
+
+function chatTargetFromSummary(item: ConversationSummary): ChatTarget {
+  return {
+    conversationId: item.id,
+    isGroup: item.is_group,
+    title: item.title,
+    members: item.members,
+    otherUserId: item.other_user_id,
+    otherUsername: withAt(item.other_username),
+    otherRank: item.other_rank,
+  };
+}
+
+/** Display name for a conversation row/header: explicit title, else the
+ * joined @handles of every other participant. */
+function conversationDisplayName(item: { title: string | null; members: ConversationMemberLite[] }): string {
+  if (item.title) return item.title;
+  if (item.members.length === 0) return 'operator';
+  return item.members.map((m) => withAt(m.username)).join(', ');
+}
+
+type MessagingContextValue = {
+  /** Open the conversation list overlay. */
+  openMessages: () => void;
+  /** Find/create a 1:1 chat with a user and open it directly. */
+  openChatWith: (otherUserId: string, otherUsername: string, otherRank: string | null) => Promise<void>;
+};
+
+const MessagingContext = createContext<MessagingContextValue | null>(null);
+
+function useMessaging(): MessagingContextValue {
+  const ctx = useContext(MessagingContext);
+  if (!ctx) {
+    throw new Error('useMessaging must be used inside MessagingProvider');
+  }
+  return ctx;
+}
+
+function MessagingProvider({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  const userId = user?.id ?? null;
+  const [visible, setVisible] = useState(false);
+  const [chat, setChat] = useState<ChatTarget | null>(null);
+
+  const openMessages = useCallback(() => {
+    triggerHaptic();
+    setChat(null);
+    setVisible(true);
+  }, []);
+
+  const close = useCallback(() => {
+    setVisible(false);
+    setChat(null);
+  }, []);
+
+  const openChatWith = useCallback(
+    async (otherUserId: string, otherUsername: string, otherRank: string | null) => {
+      triggerHaptic();
+      setVisible(true);
+      const conversationId = await findOrCreateConversation(otherUserId);
+      if (conversationId) {
+        setChat({
+          conversationId,
+          isGroup: false,
+          title: null,
+          members: [{ id: otherUserId, username: otherUsername, rank_title: otherRank }],
+          otherUserId,
+          otherUsername: withAt(otherUsername),
+          otherRank,
+        });
+      }
+    },
+    [],
+  );
+
+  const value = useMemo<MessagingContextValue>(
+    () => ({ openMessages, openChatWith }),
+    [openMessages, openChatWith],
+  );
+
+  return (
+    <MessagingContext.Provider value={value}>
+      {children}
+      <MessagesOverlay
+        visible={visible}
+        chat={chat}
+        userId={userId}
+        onClose={close}
+        onBack={() => setChat(null)}
+        onOpenConversation={setChat}
+      />
+    </MessagingContext.Provider>
+  );
+}
+
+function MessagesOverlay({
+  visible,
+  chat,
+  userId,
+  onClose,
+  onBack,
+  onOpenConversation,
+}: {
+  visible: boolean;
+  chat: ChatTarget | null;
+  userId: string | null;
+  onClose: () => void;
+  onBack: () => void;
+  onOpenConversation: (target: ChatTarget) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <Modal
+      visible
+      transparent
+      animationType="fade"
+      statusBarTranslucent
+      onRequestClose={chat ? onBack : onClose}
+    >
+      <View style={styles.overlayFill}>
+        <View
+          style={[
+            styles.overlayInner,
+            { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 24 },
+          ]}
+        >
+          {chat ? (
+            <ChatView chat={chat} userId={userId} onBack={onBack} onClose={onClose} />
+          ) : (
+            <ConversationList userId={userId} onOpen={onOpenConversation} onClose={onClose} />
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function ConversationList({
+  userId,
+  onOpen,
+  onClose,
+}: {
+  userId: string | null;
+  onOpen: (target: ChatTarget) => void;
+  onClose: () => void;
+}) {
+  const [loading, setLoading] = useState(true);
+  const [items, setItems] = useState<ConversationSummary[]>([]);
+  const [groupPickerVisible, setGroupPickerVisible] = useState(false);
+
+  const reload = useCallback(async () => {
+    if (!userId) {
+      setLoading(false);
+      return;
+    }
+    const blocked = await fetchBlockedIds(userId);
+    const convos = await fetchConversations(userId, blocked);
+    setItems(convos);
+    setLoading(false);
+  }, [userId]);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    (async () => {
+      if (!userId) {
+        if (mounted) setLoading(false);
+        return;
+      }
+      const blocked = await fetchBlockedIds(userId);
+      const convos = await fetchConversations(userId, blocked);
+      if (mounted) {
+        setItems(convos);
+        setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [userId]);
+
+  return (
+    <>
+      <View style={styles.messagesHeaderRow}>
+        <Text style={styles.messagesTitle}>MESSAGES</Text>
+        <View style={styles.messagesHeaderActions}>
+          <Pressable
+            onPress={() => setGroupPickerVisible(true)}
+            hitSlop={10}
+            style={styles.messagesNewGroupBtn}
+          >
+            <Text style={styles.messagesNewGroupText}>{'\u2795'} GROUP</Text>
+          </Pressable>
+          <Pressable onPress={onClose} hitSlop={10} style={styles.messagesCloseBtn}>
+            <Text style={styles.messagesCloseText}>{'\u2715'}</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {loading ? (
+        <ActivityIndicator color={COLORS.neon} style={styles.messagesSpinner} />
+      ) : items.length === 0 ? (
+        <Text style={styles.messagesEmpty}>
+          No conversations yet. Open an operator&apos;s profile in the Community feed and tap
+          Message to start one, or tap + GROUP above to start a group chat.
+        </Text>
+      ) : (
+        <FlatList
+          data={items}
+          keyExtractor={(item) => item.id}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.messagesListContent}
+          renderItem={({ item }) => {
+            const name = conversationDisplayName(item);
+            return (
+              <SpringPressable
+                onPress={() => onOpen(chatTargetFromSummary(item))}
+                style={({ pressed }) => [styles.card, styles.convoRow, pressed && styles.cardPressed]}
+              >
+                <Avatar handle={item.is_group ? '#' : withAt(item.other_username)} size={40} />
+                <View style={styles.convoTextBlock}>
+                  <Text style={styles.convoName} numberOfLines={1} ellipsizeMode="tail">
+                    {item.is_group ? name : withAt(item.other_username)}
+                  </Text>
+                  <Text style={styles.convoPreview} numberOfLines={1} ellipsizeMode="tail">
+                    {item.last_message ?? 'No messages yet'}
+                  </Text>
+                </View>
+                <Text style={styles.accordionChevron}>{'\u203A'}</Text>
+              </SpringPressable>
+            );
+          }}
+        />
+      )}
+
+      <NewGroupModal
+        visible={groupPickerVisible}
+        userId={userId}
+        onClose={() => setGroupPickerVisible(false)}
+        onCreated={async (target) => {
+          setGroupPickerVisible(false);
+          await reload();
+          onOpen(target);
+        }}
+      />
+    </>
+  );
+}
+
+// Group chat creation: picks from the same pool of users the community/DM
+// RLS policy already permits the viewer to see (public posters, repliers,
+// existing DM partners) — never a full user directory / enumeration.
+function NewGroupModal({
+  visible,
+  userId,
+  onClose,
+  onCreated,
+}: {
+  visible: boolean;
+  userId: string | null;
+  onClose: () => void;
+  onCreated: (target: ChatTarget) => void;
+}) {
+  const [loading, setLoading] = useState(true);
+  const [candidates, setCandidates] = useState<ConversationMemberLite[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [title, setTitle] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!visible || !userId) return;
+    let mounted = true;
+    setLoading(true);
+    setSelected(new Set());
+    setTitle('');
+    setError('');
+    (async () => {
+      const blocked = await fetchBlockedIds(userId);
+      const users = await fetchKnownUsers(userId, blocked);
+      if (mounted) {
+        setCandidates(users);
+        setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [visible, userId]);
+
+  if (!visible) return null;
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleCreate = async () => {
+    if (!userId || selected.size === 0 || creating) return;
+    setCreating(true);
+    setError('');
+    const result = await createGroupConversation(Array.from(selected), title);
+    setCreating(false);
+    if (!result.ok || !result.conversationId) {
+      setError(result.error ?? 'Could not create group chat.');
+      return;
+    }
+    const members = candidates.filter((c) => selected.has(c.id));
+    onCreated({
+      conversationId: result.conversationId,
+      isGroup: true,
+      title: title.trim() || null,
+      members,
+      otherUserId: members[0]?.id ?? '',
+      otherUsername: members[0]?.username ?? 'operator',
+      otherRank: members[0]?.rank_title ?? null,
+    });
+  };
+
+  return (
+    <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.overlayFill}>
+        <Pressable style={styles.modalBackdropFill} onPress={onClose} />
+        <View pointerEvents="box-none" style={styles.centeredCardWrap}>
+          <View style={styles.centeredCard}>
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.centeredCardScrollContent}
+            >
+              <SectionHeader label="NEW GROUP CHAT" centered />
+
+              <Text style={styles.accountEditLabel}>GROUP NAME (OPTIONAL)</Text>
+              <TextInput
+                style={styles.accountEditInput}
+                value={title}
+                onChangeText={setTitle}
+                placeholder="e.g. Bronze Squad"
+                placeholderTextColor={COLORS.muted}
+                maxLength={40}
+                editable={!creating}
+                keyboardAppearance="dark"
+              />
+
+              <Text style={[styles.accountEditLabel, { marginTop: 14 }]}>
+                SELECT MEMBERS ({selected.size} selected)
+              </Text>
+
+              {loading ? (
+                <ActivityIndicator color={COLORS.neon} style={styles.messagesSpinner} />
+              ) : candidates.length === 0 ? (
+                <Text style={styles.messagesEmpty}>
+                  No eligible operators yet. You can add anyone you&apos;ve DMed, or anyone who has
+                  posted/replied in the Community tab.
+                </Text>
+              ) : (
+                candidates.map((c) => {
+                  const checked = selected.has(c.id);
+                  return (
+                    <Pressable
+                      key={c.id}
+                      onPress={() => toggle(c.id)}
+                      style={({ pressed }) => [
+                        styles.card,
+                        styles.convoRow,
+                        styles.groupMemberRow,
+                        pressed && styles.cardPressed,
+                      ]}
+                    >
+                      <Avatar handle={withAt(c.username)} size={36} />
+                      <View style={styles.convoTextBlock}>
+                        <Text style={styles.convoName} numberOfLines={1}>
+                          {withAt(c.username)}
+                        </Text>
+                        {c.rank_title ? (
+                          <Text style={styles.convoPreview} numberOfLines={1}>
+                            {c.rank_title}
+                          </Text>
+                        ) : null}
+                      </View>
+                      <View style={[styles.groupCheckbox, checked && styles.groupCheckboxChecked]}>
+                        {checked ? <Text style={styles.groupCheckboxMark}>{'\u2713'}</Text> : null}
+                      </View>
+                    </Pressable>
+                  );
+                })
+              )}
+
+              {error ? <Text style={styles.errorText}>{error}</Text> : null}
+
+              <Pressable
+                onPress={handleCreate}
+                disabled={selected.size === 0 || creating}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  styles.accordionInlineButton,
+                  (selected.size === 0 || creating) && styles.primaryButtonDisabled,
+                  pressed && styles.primaryButtonPressed,
+                ]}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {creating ? 'CREATING...' : `CREATE GROUP (${selected.size})`}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={onClose}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  styles.accordionInlineButton,
+                  styles.cancelButtonAlt,
+                  pressed && styles.primaryButtonPressed,
+                ]}
+              >
+                <Text style={styles.primaryButtonText}>CANCEL</Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function ChatView({
+  chat,
+  userId,
+  onBack,
+  onClose,
+}: {
+  chat: ChatTarget;
+  userId: string | null;
+  onBack: () => void;
+  onClose: () => void;
+}) {
+  const [messages, setMessages] = useState<MessageRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const listRef = useRef<FlatList<MessageRow>>(null);
+
+  const reload = useCallback(async () => {
+    const blocked = userId ? await fetchBlockedIds(userId) : new Set<string>();
+    const msgs = await fetchMessages(chat.conversationId, blocked);
+    setMessages(msgs);
+    setLoading(false);
+  }, [chat.conversationId, userId]);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    (async () => {
+      const blocked = userId ? await fetchBlockedIds(userId) : new Set<string>();
+      const msgs = await fetchMessages(chat.conversationId, blocked);
+      if (mounted) {
+        setMessages(msgs);
+        setLoading(false);
+      }
+    })();
+
+    // Realtime: append inbound messages, deduped by id.
+    const unsubscribe = subscribeToMessages(chat.conversationId, (incoming) => {
+      setMessages((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]));
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [chat.conversationId, userId]);
+
+  const handleSend = async () => {
+    const text = draft.trim();
+    if (!text || !userId || sending) {
+      return;
+    }
+    setSending(true);
+    setDraft('');
+    const ok = await sendMessage(chat.conversationId, userId, text);
+    if (ok) {
+      await reload();
+    } else {
+      setDraft(text);
+    }
+    setSending(false);
+  };
+
+  return (
+    <KeyboardAvoidingView
+      style={styles.overlayFlex}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
+      <View style={styles.messagesHeaderRow}>
+        <Pressable onPress={onBack} hitSlop={10} style={styles.messagesCloseBtn}>
+          <Text style={styles.messagesBackText}>{'\u2039'}</Text>
+        </Pressable>
+        <View style={styles.chatHeaderTextBlock}>
+          <Text style={styles.convoName} numberOfLines={1} ellipsizeMode="tail">
+            {chat.isGroup ? conversationDisplayName(chat) : chat.otherUsername}
+          </Text>
+          {chat.isGroup ? (
+            <Text style={styles.chatHeaderRank} numberOfLines={1}>
+              {chat.members.length + 1} members
+            </Text>
+          ) : chat.otherRank ? (
+            <Text style={styles.chatHeaderRank} numberOfLines={1}>
+              {chat.otherRank}
+            </Text>
+          ) : null}
+        </View>
+        <Pressable onPress={onClose} hitSlop={10} style={styles.messagesCloseBtn}>
+          <Text style={styles.messagesCloseText}>{'\u2715'}</Text>
+        </Pressable>
+      </View>
+
+      {loading ? (
+        <ActivityIndicator color={COLORS.neon} style={styles.messagesSpinner} />
+      ) : (
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={(item) => item.id}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.chatListContent}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
+          ListEmptyComponent={
+            <Text style={styles.messagesEmpty}>
+              No messages yet. Say something to break the ice.
+            </Text>
+          }
+          renderItem={({ item }) => {
+            const mine = item.sender_id === userId;
+            const senderName =
+              chat.isGroup && !mine
+                ? chat.members.find((m) => m.id === item.sender_id)?.username
+                : null;
+            return (
+              <View style={[styles.msgBubbleRow, mine && styles.msgBubbleRowMine]}>
+                <View style={[styles.msgBubble, mine ? styles.msgBubbleMine : styles.msgBubbleTheirs]}>
+                  {senderName ? (
+                    <Text style={styles.msgSenderLabel} numberOfLines={1}>
+                      {withAt(senderName)}
+                    </Text>
+                  ) : null}
+                  <Text style={[styles.msgText, mine && styles.msgTextMine]}>{item.content}</Text>
+                </View>
+              </View>
+            );
+          }}
+        />
+      )}
+
+      <View style={styles.chatInputRow}>
+        <TextInput
+          style={styles.chatInput}
+          value={draft}
+          onChangeText={setDraft}
+          placeholder="Message..."
+          placeholderTextColor={COLORS.muted}
+          keyboardAppearance="dark"
+          multiline
+        />
+        <Pressable
+          onPress={handleSend}
+          disabled={draft.trim().length === 0 || sending}
+          style={({ pressed }) => [
+            styles.chatSendBtn,
+            (draft.trim().length === 0 || sending) && styles.chatSendBtnDisabled,
+            pressed && styles.primaryButtonPressed,
+          ]}
+        >
+          <Text style={styles.chatSendText}>{'\u27A4'}</Text>
+        </Pressable>
+      </View>
+    </KeyboardAvoidingView>
+  );
 }
 
 // ============================================================================
@@ -730,11 +1365,11 @@ function AppProvider({ children }: { children: React.ReactNode }) {
 // Slim centered tier pill shown at the top of scrollable content on the
 // Community and Profile tabs (the Challenges tab elevates this readout
 // into the hero TierOrb instead).
-function TierBanner({ level }: { level: number }) {
+function TierBanner({ label }: { label: string }) {
   return (
     <View style={styles.hudBar}>
       <Text style={styles.hudText} numberOfLines={1} ellipsizeMode="tail">
-        {`\u25C8  TIER LEVEL ${level}`}
+        {`\u25C8  ${label}`}
       </Text>
     </View>
   );
@@ -968,33 +1603,40 @@ function TierOrb({ level }: { level: number }) {
 
 function AppHeader() {
   const insets = useSafeAreaInsets();
-  const { userProfile, communityFeed } = useAppContext();
+  const { profile, isLoading: profileLoading } = useProfile();
+  const { openMessages } = useMessaging();
 
-  // Dynamic "unread notifications" proxy: replies left by other operators on
-  // the current user's own posts. Derived from live feed state — never a
-  // hardcoded number.
-  const notificationCount = communityFeed.reduce((total, post) => {
-    if (post.handle !== userProfile.handle) {
-      return total;
-    }
-    return total + post.replies.filter((reply) => reply.handle !== userProfile.handle).length;
-  }, 0);
+  // 🔥 Streak pill binds to Supabase. Show a subtle placeholder while the
+  // profile loads so it never renders undefined/NaN.
+  const streakLabel = profileLoading || !profile ? '---' : String(profile.streak_count);
 
+  // The header is non-interactive except the 💬 message pill, which is the
+  // gated entry point into the Messages overlay (Step 6.2). `box-none` lets
+  // touches fall through everywhere except that Pressable.
   return (
-    <View pointerEvents="none" style={[styles.appHeader, { paddingTop: insets.top }]}>
-      <View style={styles.appHeaderRow}>
+    <View pointerEvents="box-none" style={[styles.appHeader, { paddingTop: insets.top }]}>
+      <View pointerEvents="box-none" style={styles.appHeaderRow}>
         <Text style={styles.brandWordmark} numberOfLines={1}>
           <Text style={styles.brandAccent}>X</Text>TROVERT
         </Text>
-        <View style={styles.headerBadgeRow}>
+        <View pointerEvents="box-none" style={styles.headerBadgeRow}>
           <View style={styles.headerPill}>
             <Text style={styles.headerPillGlyph}>{'\uD83D\uDD25'}</Text>
-            <Text style={styles.headerPillNumber}>{userProfile.streak}</Text>
+            <Text style={styles.headerPillNumber}>{streakLabel}</Text>
           </View>
-          <View style={styles.headerPill}>
+          <Pressable
+            onPress={openMessages}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Open messages"
+            style={({ pressed }) => [
+              styles.headerPill,
+              styles.headerPillButton,
+              pressed && styles.headerPillPressed,
+            ]}
+          >
             <Text style={styles.headerPillGlyph}>{'\uD83D\uDCAC'}</Text>
-            <Text style={styles.headerPillNumber}>{notificationCount}</Text>
-          </View>
+          </Pressable>
         </View>
       </View>
     </View>
@@ -1151,6 +1793,50 @@ function LiveTicker() {
 // TAB 1 — CHALLENGES (PRIMARY EXPOSURE COCKPIT)
 // ============================================================================
 
+// Minimum characters for a valid field report (Step 2.2a).
+const MIN_JOURNAL_CHARS = 60;
+// Minimum distinct words required to defeat single-word / gibberish spam.
+const MIN_UNIQUE_WORDS = 5;
+// Submit cooldown to prevent rapid multi-tap double submissions (Step 2.2c).
+const SUBMIT_COOLDOWN_MS = 3000;
+
+// Anti-spam / content validation (Step 2.2a + 2.2b). Returns whether the
+// entry is submittable plus a human-readable status for the live counter.
+function analyzeJournalEntry(text: string): { valid: boolean; status: string; count: number } {
+  const trimmed = text.trim();
+  const count = trimmed.length;
+
+  if (count < MIN_JOURNAL_CHARS) {
+    return { valid: false, status: `${count}/${MIN_JOURNAL_CHARS} min characters`, count };
+  }
+  // Repeated single character spam (e.g. "aaaaaaaaaa...").
+  if (/(.)\1{9,}/.test(trimmed)) {
+    return { valid: false, status: 'Too many repeated characters — write a real reflection.', count };
+  }
+  const words = trimmed
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  const uniqueWords = new Set(words);
+  if (uniqueWords.size < MIN_UNIQUE_WORDS) {
+    return {
+      valid: false,
+      status: `Add more detail — at least ${MIN_UNIQUE_WORDS} distinct words required.`,
+      count,
+    };
+  }
+  // Character diversity guard against keyboard-mash gibberish.
+  const uniqueChars = new Set(trimmed.replace(/\s/g, '').toLowerCase());
+  if (uniqueChars.size < 8) {
+    return { valid: false, status: 'This looks like gibberish — describe what actually happened.', count };
+  }
+  return { valid: true, status: `${count} characters — looks good.`, count };
+}
+
+// Step 2: the challenge rectification / journaling modal. Anti-spam validated,
+// broadcast toggle defaults OFF (user must opt in) and reveals a title input,
+// and a 3s submit cooldown animation guards against multi-tap.
 function VerificationOverlay({
   visible,
   onClose,
@@ -1158,44 +1844,71 @@ function VerificationOverlay({
 }: {
   visible: boolean;
   onClose: () => void;
-  onSubmit: (text: string, broadcast: boolean) => void;
+  onSubmit: (
+    text: string,
+    broadcast: boolean,
+    postTitle: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const insets = useSafeAreaInsets();
   const [entryText, setEntryText] = useState('');
-  const [broadcastFeed, setBroadcastFeed] = useState(true);
+  const [broadcastFeed, setBroadcastFeed] = useState(false);
+  const [postTitle, setPostTitle] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [errorText, setErrorText] = useState('');
+  const cooldownAnim = useRef(new Animated.Value(0)).current;
 
-  const MIN_CHARS = 60;
-  const charCount = entryText.length;
-  const isValid = charCount >= MIN_CHARS;
+  const analysis = analyzeJournalEntry(entryText);
+  const isValid = analysis.valid;
+  const canSubmit = isValid && !submitting;
 
-  // Whenever the overlay closes — whether via Cancel, successful submit, or
-  // the Challenges tab-press interceptor — wipe the draft so the next time
-  // it opens it starts from a clean slate.
+  // Reset the draft whenever the modal closes so it always opens clean.
   useEffect(() => {
     if (!visible) {
       setEntryText('');
-      setBroadcastFeed(true);
+      setBroadcastFeed(false);
+      setPostTitle('');
+      setSubmitting(false);
+      setErrorText('');
+      cooldownAnim.setValue(0);
     }
-  }, [visible]);
+  }, [visible, cooldownAnim]);
 
-  const handleSubmit = () => {
-    if (!isValid) {
+  const handleSubmit = async () => {
+    if (!canSubmit) {
       return;
     }
-    onSubmit(entryText.trim(), broadcastFeed);
+    setSubmitting(true);
+    setErrorText('');
+    cooldownAnim.setValue(0);
+    Animated.timing(cooldownAnim, {
+      toValue: 1,
+      duration: SUBMIT_COOLDOWN_MS,
+      easing: Easing.linear,
+      useNativeDriver: false,
+    }).start();
+
+    const result = await onSubmit(entryText.trim(), broadcastFeed, postTitle.trim());
+    if (!result.ok && result.error) {
+      setErrorText(result.error);
+    }
+
+    // If the parent didn't close us (e.g. a failure), re-enable after cooldown.
+    setTimeout(() => setSubmitting(false), SUBMIT_COOLDOWN_MS);
   };
 
   if (!visible) {
     return null;
   }
 
+  const cooldownWidth = cooldownAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0%', '100%'],
+  });
+
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
       <View style={styles.overlayFill}>
-        {/* True backdrop lives as a sibling of the KAV/content below (not an
-            ancestor wrapping it), so the ScrollView's own pan responder is
-            never contested by the backdrop's press responder — vertical
-            swipes strictly scroll content, never close the modal. */}
         <Pressable style={styles.modalBackdropFill} onPress={onClose} />
         <KeyboardAvoidingView
           style={styles.overlayFlex}
@@ -1236,39 +1949,63 @@ function VerificationOverlay({
                   placeholderTextColor={COLORS.muted}
                   textAlignVertical="top"
                   keyboardAppearance="dark"
+                  editable={!submitting}
                 />
                 <Text style={[styles.charCounter, isValid && styles.charCounterValid]}>
-                  Characters: {charCount} / {MIN_CHARS} MIN
+                  {analysis.status}
                 </Text>
               </View>
 
               <View style={styles.overlayCard}>
-                <View style={[styles.toggleRow, styles.toggleRowLast]}>
+                <View style={[styles.toggleRow, !broadcastFeed && styles.toggleRowLast]}>
                   <Text style={styles.toggleLabel} numberOfLines={2} ellipsizeMode="tail">
-                    Broadcast to Global Feed
+                    Broadcast to Community
                   </Text>
                   <Switch
                     value={broadcastFeed}
                     onValueChange={setBroadcastFeed}
+                    disabled={submitting}
                     trackColor={{ false: COLORS.border, true: COLORS.emerald }}
                     thumbColor={broadcastFeed ? COLORS.neon : COLORS.muted}
                   />
                 </View>
+                {broadcastFeed ? (
+                  <View style={styles.broadcastTitleBlock}>
+                    <Text style={styles.broadcastTitleLabel}>POST TITLE</Text>
+                    <TextInput
+                      style={styles.titleInput}
+                      value={postTitle}
+                      onChangeText={setPostTitle}
+                      placeholder="Give your broadcast a clear, direct title..."
+                      placeholderTextColor={COLORS.muted}
+                      keyboardAppearance="dark"
+                      editable={!submitting}
+                    />
+                  </View>
+                ) : null}
               </View>
 
+              {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
+
               <View
-                pointerEvents={isValid ? 'auto' : 'none'}
+                pointerEvents={canSubmit ? 'auto' : 'none'}
                 style={{ opacity: isValid ? 1 : 0.4 }}
               >
                 <Pressable
                   onPress={handleSubmit}
                   style={({ pressed }) => [
                     styles.primaryButton,
+                    styles.submitCooldownButton,
                     !isValid && styles.primaryButtonDisabled,
-                    pressed && styles.primaryButtonPressed,
+                    pressed && !submitting && styles.primaryButtonPressed,
                   ]}
                 >
-                  <Text style={styles.primaryButtonText}>{'\u25C6'}  SUBMIT RECTIFICATION</Text>
+                  {submitting ? (
+                    <Animated.View style={[styles.submitCooldownFill, { width: cooldownWidth }]} />
+                  ) : null}
+                  <Text style={styles.primaryButtonText}>
+                    {submitting ? 'LOGGING...' : '\u25C6  SUBMIT RECTIFICATION'}
+                  </Text>
                 </Pressable>
               </View>
             </ScrollView>
@@ -1282,44 +2019,20 @@ function VerificationOverlay({
 // Requirement (Point 5): the Daily Quest container is a simple, clickable
 // preview card — no inline accordion. Tapping it opens a standalone,
 // centered Modal popup with the full briefing and the primary CTA.
-function QuestPreviewCard({ quest, onPress }: { quest: Quest; onPress: () => void }) {
-  return (
-    <SpringPressable
-      onPress={onPress}
-      style={({ pressed }) => [styles.card, styles.cardAccent, pressed && styles.cardPressed]}
-    >
-      <View style={styles.accordionHeaderRow}>
-        <View style={styles.cardIconBadge}>
-          <Text style={styles.cardIconGlyph}>{'\u25CE'}</Text>
-        </View>
-        <View style={styles.accordionHeaderTextBlock}>
-          <Text style={styles.questTier}>LEVEL {quest.level} DIRECTIVE</Text>
-          <Text style={styles.questTitle} numberOfLines={2} ellipsizeMode="tail">
-            {quest.title}
-          </Text>
-        </View>
-        <Text style={styles.accordionChevron}>{'\u203A'}</Text>
-      </View>
-      <Text style={styles.tapHintText}>TAP FOR FULL BRIEFING</Text>
-    </SpringPressable>
-  );
-}
-
-// Requirement (Point 5): standalone, centered popup for the Daily Quest —
-// full instructions and the Secure Quest CTA both live here now, cleanly
-// above the dimmed screen backdrop, instead of expanding in place.
+// Standalone, centered popup for the active challenge — full instructions and
+// the Secure Challenge CTA live here, above the dimmed backdrop.
 function QuestDetailModal({
   visible,
-  quest,
+  challenge,
   onClose,
   onSecureQuest,
 }: {
   visible: boolean;
-  quest: Quest;
+  challenge: ActiveChallenge | null;
   onClose: () => void;
   onSecureQuest: () => void;
 }) {
-  if (!visible) {
+  if (!visible || !challenge) {
     return null;
   }
 
@@ -1334,10 +2047,12 @@ function QuestDetailModal({
               showsVerticalScrollIndicator={false}
               contentContainerStyle={styles.centeredCardScrollContent}
             >
-              <Text style={styles.questTier}>LEVEL {quest.level} DIRECTIVE</Text>
-              <Text style={[styles.questTitle, styles.questTitleCentered]}>{quest.title}</Text>
+              <Text style={styles.questTier}>
+                {(challenge.requiredRank ?? 'FIELD').toUpperCase()} DIRECTIVE
+              </Text>
+              <Text style={[styles.questTitle, styles.questTitleCentered]}>{challenge.title}</Text>
               <View style={styles.questDivider} />
-              <Text style={styles.bodyText}>{quest.instructions}</Text>
+              <Text style={styles.bodyText}>{challenge.instructions}</Text>
               <View style={styles.accordionButtonWrap}>
                 <Pressable
                   onPress={() => {
@@ -1423,15 +2138,21 @@ function SystemLockModal({ visible, onClose }: { visible: boolean; onClose: () =
 }
 
 // ---- Home card: Growth Stage overview --------------------------------------
-// Circular growth ring (overall growth) + hero stage number/title bound to
-// live level, plus Social/Support growth bars. Pressing opens the existing
-// score-breakdown popup, preserving that behavior.
+// Circular growth ring driven by the live social_score, hero stage number, and
+// the Supabase rank_title. Support Growth was removed — social_score is now the
+// single progression metric. Pressing opens the existing score-breakdown popup.
 function GrowthStageCard({ onPressDetails }: { onPressDetails: () => void }) {
-  const { userProfile } = useAppContext();
-  const socialRatio = userProfile.socialScore / MAX_SOCIAL_SCORE;
-  const supportRatio = userProfile.supportScore / MAX_SUPPORT_SCORE;
-  const overall = (socialRatio + supportRatio) / 2;
-  const stageTitle = getStageTitle(userProfile.level);
+  const { profile, isLoading: profileLoading } = useProfile();
+
+  const loading = profileLoading || !profile;
+  const socialScore = profile?.social_score ?? 0;
+  const rankTitle = loading ? 'Starter' : profile?.rank_title || 'Starter';
+  const { ratio: socialRatio, target: nextRankTarget } = computeRankProgress(rankTitle, socialScore);
+  const stageNumber = loading ? '---' : String(rankStage(rankTitle));
+
+  const socialScoreLabel = loading ? '---' : String(socialScore);
+  const socialTargetLabel = nextRankTarget === null ? 'MAX' : String(nextRankTarget);
+  const socialPctLabel = loading ? '---' : `${Math.round(socialRatio * 100)}%`;
 
   return (
     <SpringPressable
@@ -1442,14 +2163,14 @@ function GrowthStageCard({ onPressDetails }: { onPressDetails: () => void }) {
       style={({ pressed }) => [styles.card, styles.growthCard, pressed && styles.cardPressed]}
     >
       <View style={styles.growthTopRow}>
-        <ProgressRing size={76} strokeWidth={6} progress={overall}>
+        <ProgressRing size={76} strokeWidth={6} progress={loading ? 0 : socialRatio}>
           <Text style={styles.growthRingGlyph}>{'\uD83C\uDF31'}</Text>
         </ProgressRing>
         <View style={styles.growthTopText}>
           <Text style={styles.growthLabel}>GROWTH STAGE</Text>
-          <Text style={styles.growthNumber}>{userProfile.level}</Text>
+          <Text style={styles.growthNumber}>{stageNumber}</Text>
           <Text style={styles.growthStageTitle} numberOfLines={1}>
-            {stageTitle}
+            {rankTitle}
           </Text>
           <Text style={styles.growthMotivation}>Keep growing.</Text>
         </View>
@@ -1462,20 +2183,11 @@ function GrowthStageCard({ onPressDetails }: { onPressDetails: () => void }) {
         <View style={styles.growthMetricCol}>
           <Text style={styles.growthMetricLabel}>SOCIAL GROWTH</Text>
           <Text style={styles.growthMetricValue}>
-            {userProfile.socialScore}
-            <Text style={styles.growthMetricMax}> / {MAX_SOCIAL_SCORE}</Text>
+            {socialScoreLabel}
+            <Text style={styles.growthMetricMax}> / {socialTargetLabel}</Text>
           </Text>
-          <ProgressBar ratio={socialRatio} />
-          <Text style={styles.growthMetricPct}>{Math.round(socialRatio * 100)}%</Text>
-        </View>
-        <View style={styles.growthMetricCol}>
-          <Text style={styles.growthMetricLabel}>SUPPORT GROWTH</Text>
-          <Text style={styles.growthMetricValue}>
-            {userProfile.supportScore}
-            <Text style={styles.growthMetricMax}> / {MAX_SUPPORT_SCORE}</Text>
-          </Text>
-          <ProgressBar ratio={supportRatio} />
-          <Text style={styles.growthMetricPct}>{Math.round(supportRatio * 100)}%</Text>
+          <ProgressBar ratio={loading ? 0 : socialRatio} />
+          <Text style={styles.growthMetricPct}>{socialPctLabel}</Text>
         </View>
       </View>
     </SpringPressable>
@@ -1484,8 +2196,29 @@ function GrowthStageCard({ onPressDetails }: { onPressDetails: () => void }) {
 
 // ---- Home card: Today's Challenge (hero) -----------------------------------
 function TodayChallengeCard({ onAccept }: { onAccept: () => void }) {
-  const { activeQuest } = useAppContext();
-  const difficulty = getDifficultyLabel(activeQuest.level);
+  const { activeChallenge, challengeLoading } = useAppContext();
+
+  if (challengeLoading && !activeChallenge) {
+    return (
+      <View style={[styles.card, styles.challengeCard]}>
+        <Text style={styles.challengeKicker}>{'\u26A1'}  TODAY&apos;S CHALLENGE</Text>
+        <Text style={styles.challengeTitle}>---</Text>
+        <Text style={styles.challengeDesc}>Loading your next directive...</Text>
+      </View>
+    );
+  }
+
+  if (!activeChallenge) {
+    return (
+      <View style={[styles.card, styles.challengeCard]}>
+        <Text style={styles.challengeKicker}>{'\u26A1'}  TODAY&apos;S CHALLENGE</Text>
+        <Text style={styles.challengeTitle} numberOfLines={2}>ALL CLEAR</Text>
+        <Text style={styles.challengeDesc}>
+          No challenges available for your rank right now. Check back soon, operator.
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <View style={[styles.card, styles.challengeCard]}>
@@ -1494,10 +2227,10 @@ function TodayChallengeCard({ onAccept }: { onAccept: () => void }) {
       <View style={styles.challengeBodyRow}>
         <View style={styles.challengeTextBlock}>
           <Text style={styles.challengeTitle} numberOfLines={3}>
-            {activeQuest.title}
+            {activeChallenge.title}
           </Text>
           <Text style={styles.challengeDesc} numberOfLines={3} ellipsizeMode="tail">
-            {activeQuest.instructions}
+            {activeChallenge.instructions}
           </Text>
         </View>
         <View style={styles.challengeGlowCircle}>
@@ -1507,9 +2240,9 @@ function TodayChallengeCard({ onAccept }: { onAccept: () => void }) {
 
       <View style={styles.challengeBadgeRow}>
         <View style={styles.difficultyPill}>
-          <Text style={styles.difficultyPillText}>{difficulty}</Text>
+          <Text style={styles.difficultyPillText}>{activeChallenge.difficulty}</Text>
         </View>
-        <Text style={styles.challengeReward}>+{SOCIAL_SCORE_REWARD} Social Growth</Text>
+        <Text style={styles.challengeReward}>+{activeChallenge.xpReward} Social Growth</Text>
       </View>
 
       <SpringPressable
@@ -1526,17 +2259,45 @@ function TodayChallengeCard({ onAccept }: { onAccept: () => void }) {
   );
 }
 
+// ---- Home body: operator identity slot (username + bio) --------------------
+// Lives in the dashboard body — NOT the top nav logo banner. Binds to the live
+// Supabase profile with subtle loading placeholders.
+function IdentitySlot() {
+  const { profile, isLoading } = useProfile();
+
+  const loading = isLoading || !profile;
+  const usernameRaw = profile?.username ?? '';
+  const usernameLabel = loading ? '---' : usernameRaw ? withAt(usernameRaw) : '—';
+  const bioLabel = loading ? '---' : profile?.bio || 'No bio yet';
+
+  return (
+    <View style={[styles.card, styles.identitySlotCard]}>
+      <Text style={styles.identitySlotUsername} numberOfLines={1} ellipsizeMode="tail">
+        {usernameLabel}
+      </Text>
+      <Text style={styles.identitySlotBio} numberOfLines={2} ellipsizeMode="tail">
+        {bioLabel}
+      </Text>
+    </View>
+  );
+}
+
 // ---- Home card: Day Streak tracker -----------------------------------------
 function DayStreakCard() {
-  const { userProfile } = useAppContext();
-  const week = getWeekProgress(userProfile.streak);
+  const { profile, isLoading } = useProfile();
+  const { streakWeek } = useAppContext();
+
+  const loading = isLoading || !profile;
+  const streakCount = profile?.streak_count ?? 0;
+  const streakLabel = loading ? '---' : String(streakCount);
+  const week = computeWeekMarks(streakWeek);
 
   return (
     <View style={[styles.card, styles.streakCard]}>
       <View style={styles.streakLeft}>
         <Text style={styles.streakFlame}>{'\uD83D\uDD25'}</Text>
         <View>
-          <Text style={styles.streakNumber}>{userProfile.streak}</Text>
+          <Text style={styles.streakNumber}>{streakLabel}</Text>
           <Text style={styles.streakCaption}>Day Streak</Text>
         </View>
       </View>
@@ -1560,7 +2321,11 @@ function DayStreakCard() {
 
 // ---- Home card: Daily Quote (new structural addition) ----------------------
 function DailyQuoteCard() {
-  const { dailyQuote } = useAppContext();
+  const { dailyQuote, dailyQuoteLoading } = useAppContext();
+
+  const showSkeleton = dailyQuoteLoading && !dailyQuote;
+  const text = dailyQuote?.text ?? '---';
+  const author = dailyQuote?.author ?? '---';
 
   return (
     <View style={[styles.card, styles.quoteCard]}>
@@ -1568,10 +2333,283 @@ function DailyQuoteCard() {
         <Text style={styles.quoteLeafGlyph}>{'\uD83C\uDF31'}</Text>
       </View>
       <View style={styles.quoteTextBlock}>
-        <Text style={styles.quoteText}>&ldquo;{dailyQuote.text}&rdquo;</Text>
-        <Text style={styles.quoteAuthor}>&ndash; {dailyQuote.author}</Text>
+        {showSkeleton ? (
+          <ActivityIndicator color={COLORS.neon} />
+        ) : (
+          <>
+            <Text style={styles.quoteText}>&ldquo;{text}&rdquo;</Text>
+            <Text style={styles.quoteAuthor}>&ndash; {author}</Text>
+          </>
+        )}
       </View>
       <Text style={styles.quoteMountain}>{'\uD83C\uDFD4\uFE0F'}</Text>
+    </View>
+  );
+}
+
+// Human-readable "time left" for a cooldown, e.g. "6h" or "3d".
+function formatRemaining(ms: number): string {
+  if (ms <= 0) return '0h';
+  const hours = Math.ceil(ms / 3_600_000);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.ceil(ms / 86_400_000)}d`;
+}
+
+// Requirement (Point 5): editable username/bio inside Account Overview.
+// Every actual write is server-validated (length/charset/uniqueness/cooldown)
+// via update_username()/update_bio() — this component only decides what to
+// show and disables the button locally as a UX nicety; the database is the
+// real gatekeeper, so there is no way to bypass the cooldown or spoof
+// someone else's row from here even if this client-side logic were removed.
+const USERNAME_COOLDOWN_MS = 7 * 86_400_000;
+const BIO_COOLDOWN_MS = 1 * 86_400_000;
+
+function AccountEditSection() {
+  const { profile, updateUsername, updateBio } = useProfile();
+  const [usernameDraft, setUsernameDraft] = useState('');
+  const [bioDraft, setBioDraft] = useState('');
+  const [usernameSaving, setUsernameSaving] = useState(false);
+  const [bioSaving, setBioSaving] = useState(false);
+  const [usernameMsg, setUsernameMsg] = useState('');
+  const [bioMsg, setBioMsg] = useState('');
+
+  useEffect(() => {
+    setUsernameDraft(profile?.username ?? '');
+  }, [profile?.username]);
+  useEffect(() => {
+    setBioDraft(profile?.bio ?? '');
+  }, [profile?.bio]);
+
+  if (!profile) {
+    return null;
+  }
+
+  const usernameChanged = usernameDraft.trim().length > 0 && usernameDraft.trim() !== profile.username;
+  const bioChanged = bioDraft.trim() !== profile.bio;
+
+  const usernameCooldownMs = profile.last_username_change_at
+    ? new Date(profile.last_username_change_at).getTime() + USERNAME_COOLDOWN_MS - Date.now()
+    : 0;
+  const bioCooldownMs = profile.last_bio_change_at
+    ? new Date(profile.last_bio_change_at).getTime() + BIO_COOLDOWN_MS - Date.now()
+    : 0;
+  const usernameLocked = usernameCooldownMs > 0;
+  const bioLocked = bioCooldownMs > 0;
+
+  const handleSaveUsername = async () => {
+    if (!usernameChanged || usernameSaving || usernameLocked) {
+      return;
+    }
+    setUsernameSaving(true);
+    setUsernameMsg('');
+    const result = await updateUsername(usernameDraft.trim());
+    setUsernameMsg(result.ok ? 'Username updated.' : result.error ?? 'Could not update username.');
+    setUsernameSaving(false);
+  };
+
+  const handleSaveBio = async () => {
+    if (!bioChanged || bioSaving || bioLocked) {
+      return;
+    }
+    setBioSaving(true);
+    setBioMsg('');
+    const result = await updateBio(bioDraft.trim());
+    setBioMsg(result.ok ? 'Bio updated.' : result.error ?? 'Could not update bio.');
+    setBioSaving(false);
+  };
+
+  return (
+    <View style={styles.accountEditBlock}>
+      <View style={styles.questDivider} />
+      <Text style={styles.accountEditLabel}>USERNAME</Text>
+      <TextInput
+        style={styles.accountEditInput}
+        value={usernameDraft}
+        onChangeText={setUsernameDraft}
+        placeholder="username"
+        placeholderTextColor={COLORS.muted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        maxLength={20}
+        editable={!usernameSaving}
+        keyboardAppearance="dark"
+      />
+      {usernameLocked ? (
+        <Text style={styles.accountEditHint}>
+          Next change available in {formatRemaining(usernameCooldownMs)}.
+        </Text>
+      ) : null}
+      {usernameMsg ? <Text style={styles.accountEditHint}>{usernameMsg}</Text> : null}
+      <Pressable
+        onPress={handleSaveUsername}
+        disabled={!usernameChanged || usernameSaving || usernameLocked}
+        style={({ pressed }) => [
+          styles.primaryButton,
+          styles.accountEditSaveButton,
+          (!usernameChanged || usernameLocked) && styles.primaryButtonDisabled,
+          pressed && styles.primaryButtonPressed,
+        ]}
+      >
+        <Text style={styles.primaryButtonText}>{usernameSaving ? 'SAVING...' : 'SAVE USERNAME'}</Text>
+      </Pressable>
+
+      <View style={styles.questDivider} />
+
+      <Text style={styles.accountEditLabel}>BIO</Text>
+      <TextInput
+        style={[styles.accountEditInput, styles.accountEditBioInput]}
+        value={bioDraft}
+        onChangeText={setBioDraft}
+        placeholder="Tell other operators a little about yourself..."
+        placeholderTextColor={COLORS.muted}
+        multiline
+        maxLength={220}
+        editable={!bioSaving}
+        keyboardAppearance="dark"
+        textAlignVertical="top"
+      />
+      <Text style={styles.accountEditCounter}>{bioDraft.trim().length}/220</Text>
+      {bioLocked ? (
+        <Text style={styles.accountEditHint}>Next change available in {formatRemaining(bioCooldownMs)}.</Text>
+      ) : null}
+      {bioMsg ? <Text style={styles.accountEditHint}>{bioMsg}</Text> : null}
+      <Pressable
+        onPress={handleSaveBio}
+        disabled={!bioChanged || bioSaving || bioLocked}
+        style={({ pressed }) => [
+          styles.primaryButton,
+          styles.accountEditSaveButton,
+          (!bioChanged || bioLocked) && styles.primaryButtonDisabled,
+          pressed && styles.primaryButtonPressed,
+        ]}
+      >
+        <Text style={styles.primaryButtonText}>{bioSaving ? 'SAVING...' : 'SAVE BIO'}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+// Dev/QA-only test-account switcher — compiled out of production builds by
+// the __DEV__ guard. Lets a tester sign in as a permanent test operator
+// (created via the Supabase dashboard) to verify messaging/community
+// features from a second identity. Never touches game-state RPCs; it only
+// calls the same signInWithPassword/signOut Supabase Auth APIs.
+function DevTestPanel() {
+  const { user, isAnonymous, signOut, signInWithPassword } = useAuth();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  if (!__DEV__) {
+    return null;
+  }
+
+  const handleSignIn = async () => {
+    if (!email.trim() || !password || busy) return;
+    setBusy(true);
+    setMsg('');
+    const result = await signInWithPassword(email.trim(), password);
+    setMsg(result.ok ? 'Signed in as test operator.' : result.error ?? 'Sign-in failed.');
+    setBusy(false);
+  };
+
+  const handleSignOut = async () => {
+    setBusy(true);
+    await signOut();
+    setBusy(false);
+    setMsg('Signed out. Sign in as another test operator below, or restart the app to mint a fresh anonymous session.');
+  };
+
+  return (
+    <View style={styles.accountEditBlock}>
+      <View style={styles.questDivider} />
+      <Text style={styles.accountEditLabel}>DEV/QA TEST LOGIN — HIDDEN IN PRODUCTION BUILDS</Text>
+      <Text style={styles.accountEditHint}>
+        Session: {isAnonymous ? 'anonymous' : 'permanent'} · uid {user?.id?.slice(0, 8) ?? '---'}
+      </Text>
+      <TextInput
+        style={styles.accountEditInput}
+        value={email}
+        onChangeText={setEmail}
+        placeholder="test operator email"
+        placeholderTextColor={COLORS.muted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        keyboardType="email-address"
+        editable={!busy}
+        keyboardAppearance="dark"
+      />
+      <TextInput
+        style={styles.accountEditInput}
+        value={password}
+        onChangeText={setPassword}
+        placeholder="password"
+        placeholderTextColor={COLORS.muted}
+        secureTextEntry
+        autoCapitalize="none"
+        editable={!busy}
+        keyboardAppearance="dark"
+      />
+      {msg ? <Text style={styles.accountEditHint}>{msg}</Text> : null}
+      <Pressable
+        onPress={handleSignIn}
+        disabled={!email.trim() || !password || busy}
+        style={({ pressed }) => [
+          styles.primaryButton,
+          styles.accountEditSaveButton,
+          (!email.trim() || !password) && styles.primaryButtonDisabled,
+          pressed && styles.primaryButtonPressed,
+        ]}
+      >
+        <Text style={styles.primaryButtonText}>{busy ? 'WORKING...' : 'SIGN IN AS TEST OPERATOR'}</Text>
+      </Pressable>
+      <Pressable
+        onPress={handleSignOut}
+        disabled={busy}
+        style={({ pressed }) => [
+          styles.primaryButton,
+          styles.accountEditSaveButton,
+          styles.cancelButtonAlt,
+          pressed && styles.primaryButtonPressed,
+        ]}
+      >
+        <Text style={styles.primaryButtonText}>SIGN OUT</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+// Formats an ISO timestamp into the app's "DD MON YYYY" stamp; empty on parse.
+function formatIsoDate(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : formatDateStamp(d);
+}
+
+// Step 4: Home tab now surfaces a Journal nav card (mirroring the Profile
+// tab's pattern) instead of dumping every entry's full body text inline.
+// Tapping it opens the same shared JournalModal used on Profile.
+function HomeJournalNavCard({ onPress }: { onPress: () => void }) {
+  const { journalEntries } = useAppContext();
+
+  return (
+    <View>
+      <SectionHeader label="PERSONAL JOURNAL" />
+      <SpringPressable
+        onPress={onPress}
+        style={({ pressed }) => [styles.card, styles.journalNavCard, pressed && styles.cardPressed]}
+      >
+        <View style={styles.cardIconBadge}>
+          <Text style={styles.cardIconGlyph}>{'\u25A6'}</Text>
+        </View>
+        <View style={styles.journalNavTextBlock}>
+          <Text style={styles.journalNavTitle}>JOURNAL</Text>
+          <Text style={styles.journalNavSubtext} numberOfLines={2} ellipsizeMode="tail">
+            {journalEntries.length} logged reflections — tap to review or write a new entry.
+          </Text>
+        </View>
+        <Text style={styles.accordionChevron}>{'\u203A'}</Text>
+      </SpringPressable>
     </View>
   );
 }
@@ -1579,15 +2617,24 @@ function DailyQuoteCard() {
 function ChallengesScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<BottomTabNavigationProp<RootTabParamList, 'Challenges'>>();
-  const { userProfile, activeQuest, submitVerification, loadNextChallenge } = useAppContext();
+  const {
+    activeChallenge,
+    challengeCompleted,
+    lastAwardedXp,
+    submitChallenge,
+    loadNextChallenge,
+  } = useAppContext();
+  const { profile } = useProfile();
+  const { journalEntries } = useAppContext();
   const [overlayVisible, setOverlayVisible] = useState(false);
-  const [questCompleted, setQuestCompleted] = useState(false);
   const [questModalVisible, setQuestModalVisible] = useState(false);
   const [vitalsModalVisible, setVitalsModalVisible] = useState(false);
+  const [journalVisible, setJournalVisible] = useState(false);
 
-  // Requirement 5: pressing the Home tab icon while the verification overlay
-  // is open must abort it cleanly instead of leaving it open underneath
-  // whatever the navigator does by default.
+  const streakLabel = profile ? String(profile.streak_count) : '---';
+  const socialScoreLabel = profile ? String(profile.social_score) : '---';
+
+  // Pressing the Home tab icon while the verification overlay is open aborts it.
   useEffect(() => {
     const unsubscribe = navigation.addListener('tabPress', () => {
       setOverlayVisible(false);
@@ -1595,16 +2642,17 @@ function ChallengesScreen() {
     return unsubscribe;
   }, [navigation]);
 
-  const handleSubmit = (text: string, broadcast: boolean) => {
-    submitVerification(text, broadcast);
-    setOverlayVisible(false);
-    setQuestCompleted(true);
+  const handleSubmit = async (text: string, broadcast: boolean, postTitle: string) => {
+    const result = await submitChallenge(text, broadcast, postTitle);
+    if (result.ok) {
+      setOverlayVisible(false);
+    }
+    return result;
   };
 
-  const handleLoadAnother = () => {
-    loadNextChallenge();
-    setQuestCompleted(false);
+  const handleLoadAnother = async () => {
     setQuestModalVisible(false);
+    await loadNextChallenge();
   };
 
   const scrollY = useSharedValue(0);
@@ -1629,22 +2677,24 @@ function ChallengesScreen() {
         ]}
         showsVerticalScrollIndicator={false}
       >
+        <IdentitySlot />
+
         <GrowthStageCard onPressDetails={() => setVitalsModalVisible(true)} />
 
-        {questCompleted ? (
+        {challengeCompleted ? (
           <>
             <View style={[styles.card, styles.missionCompleteCard]}>
               <Text style={styles.challengeKicker}>{'\u2713'}  QUEST CLEARED</Text>
               <Text style={styles.challengeTitle} numberOfLines={2} ellipsizeMode="tail">
-                {activeQuest.title}
+                {activeChallenge?.title ?? 'CHALLENGE COMPLETE'}
               </Text>
               <View style={styles.growthDivider} />
               <Text style={styles.bodyText}>
-                +{SOCIAL_SCORE_REWARD} Social Score awarded. Current streak: {userProfile.streak}{' '}
-                days.
+                +{lastAwardedXp} Social Score awarded. Current streak: {streakLabel} days.
               </Text>
             </View>
 
+            {/* Step 3: unlimited daily challenges — load the next uncompleted one. */}
             <SpringPressable
               onPress={handleLoadAnother}
               style={({ pressed }) => [
@@ -1653,7 +2703,7 @@ function ChallengesScreen() {
                 pressed && styles.acceptButtonPressed,
               ]}
             >
-              <Text style={styles.acceptButtonText}>LOAD ANOTHER CHALLENGE</Text>
+              <Text style={styles.acceptButtonText}>LOAD NEXT CHALLENGE</Text>
               <Text style={styles.acceptButtonArrow}>{'\u27F3'}</Text>
             </SpringPressable>
           </>
@@ -1664,9 +2714,17 @@ function ChallengesScreen() {
         <DayStreakCard />
 
         <DailyQuoteCard />
+
+        <HomeJournalNavCard onPress={() => setJournalVisible(true)} />
       </Reanimated.ScrollView>
 
       <AppHeader />
+
+      <JournalModal
+        visible={journalVisible}
+        onClose={() => setJournalVisible(false)}
+        journals={journalEntries}
+      />
 
       <VerificationOverlay
         visible={overlayVisible}
@@ -1676,7 +2734,7 @@ function ChallengesScreen() {
 
       <QuestDetailModal
         visible={questModalVisible}
-        quest={activeQuest}
+        challenge={activeChallenge}
         onClose={() => setQuestModalVisible(false)}
         onSecureQuest={() => {
           setQuestModalVisible(false);
@@ -1690,21 +2748,14 @@ function ChallengesScreen() {
         title="SCORE BREAKDOWN"
       >
         <Text style={styles.bodyText}>
-          Unbroken Streak counts consecutive calendar days with at least one verified quest
-          completion. Completing multiple quests in the same day only counts once — current
-          streak: {userProfile.streak} days.
+          Unbroken Streak counts consecutive calendar days on which you complete at least one
+          challenge. Completing multiple challenges in the same day only counts once — current
+          streak: {streakLabel} days.
         </Text>
         <View style={styles.questDivider} />
         <Text style={styles.bodyText}>
-          Social Score accumulates via real-world social friction. Every verified quest
-          submission awards +{SOCIAL_SCORE_REWARD} Social Score — current total:{' '}
-          {userProfile.socialScore}.
-        </Text>
-        <View style={styles.questDivider} />
-        <Text style={styles.bodyText}>
-          Support Score accumulates via direct peer reinforcement. Replying to another
-          operator&apos;s field report awards +{SUPPORT_SCORE_REWARD} Support Score — current
-          total: {userProfile.supportScore}.
+          Social Score is your single progression metric. Every verified challenge submission
+          awards its listed XP — current total: {socialScoreLabel}.
         </Text>
       </InfoPopupModal>
     </View>
@@ -1715,21 +2766,37 @@ function ChallengesScreen() {
 // TAB 2 — COMMUNITY (ACTION REPORT TIMELINE)
 // ============================================================================
 
+// Relative "Xm/Xh/Xd ago" stamp from an ISO timestamp; falls back to a date.
+function relativeTime(iso: string): string {
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) {
+    return '';
+  }
+  const diffMin = Math.floor((Date.now() - t) / 60000);
+  if (diffMin < 1) return 'Just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return formatIsoDate(iso);
+}
+
 function FeedCard({
   post,
   onPressHandle,
   onPressPost,
   onToggleLike,
 }: {
-  post: FeedPost;
-  onPressHandle: (post: FeedPost) => void;
-  onPressPost: (post: FeedPost) => void;
+  post: CommunityPost;
+  onPressHandle: (post: CommunityPost) => void;
+  onPressPost: (post: CommunityPost) => void;
   onToggleLike: (postId: string) => void;
 }) {
   const replyCountLabel =
-    post.replies.length === 0
+    post.replyCount === 0
       ? 'No replies yet'
-      : `${post.replies.length} ${post.replies.length === 1 ? 'reply' : 'replies'}`;
+      : `${post.replyCount} ${post.replyCount === 1 ? 'reply' : 'replies'}`;
 
   return (
     <SpringPressable
@@ -1737,19 +2804,17 @@ function FeedCard({
       style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
     >
       <View style={styles.feedTopRow}>
-        <Avatar handle={post.handle} profilePictureUrl={post.profilePictureUrl} size={32} />
-        <Pressable
-          onPress={() => onPressHandle(post)}
-          style={styles.handlePressable}
-          hitSlop={8}
-        >
+        <Avatar handle={post.authorUsername} size={32} />
+        <Pressable onPress={() => onPressHandle(post)} style={styles.handlePressable} hitSlop={8}>
           <Text style={styles.feedHandle} numberOfLines={1} ellipsizeMode="tail">
-            {post.handle}
+            {post.authorUsername}
           </Text>
         </Pressable>
-        <Text style={styles.feedLevelTag}>[LVL {post.level}]</Text>
+        <Text style={styles.feedLevelTag} numberOfLines={1}>
+          [{post.authorRank.toUpperCase()}]
+        </Text>
         <Text style={styles.feedTimestamp} numberOfLines={1} ellipsizeMode="tail">
-          {post.timestamp}
+          {relativeTime(post.createdAt)}
         </Text>
       </View>
 
@@ -1760,11 +2825,7 @@ function FeedCard({
       <Text style={styles.bodyText}>{post.body}</Text>
 
       <View style={styles.feedBottomRow}>
-        <Pressable
-          onPress={() => onToggleLike(post.id)}
-          style={styles.likeButton}
-          hitSlop={8}
-        >
+        <Pressable onPress={() => onToggleLike(post.id)} style={styles.likeButton} hitSlop={8}>
           <Text style={[styles.likeIcon, post.liked && styles.likeIconActive]}>
             {post.liked ? '\u2665' : '\u2661'}
           </Text>
@@ -1786,16 +2847,26 @@ function FeedCard({
   );
 }
 
+// Step 6.1: inspecting an operator exposes a "Message" action (find/create a
+// 1:1 chat). Also offers a user-level Block (Step 5.4b).
 function InspectProfileModal({
   post,
+  currentUserId,
   onClose,
+  onMessage,
+  onBlock,
 }: {
-  post: FeedPost | null;
+  post: CommunityPost | null;
+  currentUserId: string | null;
   onClose: () => void;
+  onMessage: (post: CommunityPost) => void;
+  onBlock: (post: CommunityPost) => void;
 }) {
   if (!post) {
     return null;
   }
+
+  const isSelf = post.userId === currentUserId;
 
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
@@ -1810,30 +2881,45 @@ function InspectProfileModal({
             >
               <View style={styles.inspectAvatar}>
                 <Text style={styles.inspectAvatarText}>
-                  {post.handle.replace('@', '').charAt(0).toUpperCase()}
+                  {post.authorUsername.replace('@', '').charAt(0).toUpperCase()}
                 </Text>
               </View>
               <Text style={styles.inspectHandle} numberOfLines={1} ellipsizeMode="tail">
-                {post.handle}
+                {post.authorUsername}
               </Text>
-              <Text style={styles.inspectLevel}>OPERATOR TIER — LEVEL {post.level}</Text>
+              <Text style={styles.inspectLevel}>RANK — {post.authorRank.toUpperCase()}</Text>
               <View style={styles.inspectDivider} />
-              <Text style={styles.inspectMetrics}>
-                [ SOCIAL SCORE: {post.socialScore} ] | [ SUPPORT SCORE: {post.supportScore} ]
-              </Text>
               <Text style={styles.inspectSubtext}>
-                Performance metrics only. The grid does not rank operators against each
-                other.
+                {post.authorBio.trim()
+                  ? post.authorBio
+                  : 'Operators grow through real-world reps — the grid does not rank operators ' +
+                    'against each other.'}
               </Text>
-              <Pressable
-                onPress={onClose}
-                style={({ pressed }) => [
-                  styles.primaryButton,
-                  styles.inspectCloseButton,
-                  pressed && styles.primaryButtonPressed,
-                ]}
-              >
-                <Text style={styles.primaryButtonText}>{'\u2713'}  CLOSE DOSSIER</Text>
+
+              {!isSelf ? (
+                <Pressable
+                  onPress={() => onMessage(post)}
+                  style={({ pressed }) => [
+                    styles.primaryButton,
+                    styles.inspectCloseButton,
+                    pressed && styles.primaryButtonPressed,
+                  ]}
+                >
+                  <Text style={styles.primaryButtonText}>{'\uD83D\uDCAC'}  MESSAGE</Text>
+                </Pressable>
+              ) : null}
+
+              {!isSelf ? (
+                <Pressable
+                  onPress={() => onBlock(post)}
+                  style={({ pressed }) => [styles.dangerButton, pressed && styles.cardPressed]}
+                >
+                  <Text style={styles.dangerButtonText}>{'\u2298'}  BLOCK OPERATOR</Text>
+                </Pressable>
+              ) : null}
+
+              <Pressable onPress={onClose} style={styles.abortButton}>
+                <Text style={styles.abortButtonText}>CLOSE DOSSIER</Text>
               </Pressable>
             </ScrollView>
           </View>
@@ -1843,51 +2929,127 @@ function InspectProfileModal({
   );
 }
 
+// Step 5.4a: reason picker for reporting content.
+function ReportModal({
+  visible,
+  onClose,
+  onSubmit,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onSubmit: (reason: string) => void;
+}) {
+  if (!visible) {
+    return null;
+  }
+  return (
+    <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.overlayFill}>
+        <Pressable style={styles.modalBackdropFill} onPress={onClose} />
+        <View pointerEvents="box-none" style={styles.centeredCardWrap}>
+          <View style={styles.centeredCard}>
+            <SectionHeader label="REPORT CONTENT" centered />
+            <Text style={styles.bodyText}>
+              Select a reason. Our team reviews every report and takes action on violations.
+            </Text>
+            <View style={styles.reportReasonList}>
+              {REPORT_REASONS.map((reason) => (
+                <Pressable
+                  key={reason}
+                  onPress={() => onSubmit(reason)}
+                  style={({ pressed }) => [styles.reportReasonRow, pressed && styles.cardPressed]}
+                >
+                  <Text style={styles.reportReasonText}>{reason}</Text>
+                  <Text style={styles.accordionChevron}>{'\u203A'}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable onPress={onClose} style={styles.abortButton}>
+              <Text style={styles.abortButtonText}>CANCEL</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function PostDetailModal({
   post,
-  currentUserHandle,
+  currentUserId,
   onClose,
-  onSubmitReply,
   onToggleLike,
-  onToggleReplyLike,
+  onReport,
+  onBlock,
+  onReplyCountChange,
 }: {
-  post: FeedPost | null;
-  currentUserHandle: string;
+  post: CommunityPost | null;
+  currentUserId: string | null;
   onClose: () => void;
-  onSubmitReply: (postId: string, text: string) => void;
   onToggleLike: (postId: string) => void;
-  onToggleReplyLike: (postId: string, replyId: string) => void;
+  onReport: (post: CommunityPost, reason: string) => void;
+  onBlock: (post: CommunityPost) => void;
+  onReplyCountChange: (postId: string, count: number) => void;
 }) {
   const insets = useSafeAreaInsets();
   const [replyText, setReplyText] = useState('');
+  const [replies, setReplies] = useState<PostReplyRow[]>([]);
+  const [loadingReplies, setLoadingReplies] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [reportVisible, setReportVisible] = useState(false);
+
+  const postId = post?.id ?? null;
 
   useEffect(() => {
-    if (!post) {
+    if (!postId) {
       setReplyText('');
+      setReplies([]);
+      return;
     }
-  }, [post]);
+    let mounted = true;
+    setLoadingReplies(true);
+    (async () => {
+      const rows = await fetchReplies(postId);
+      if (mounted) {
+        setReplies(rows);
+        setLoadingReplies(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [postId]);
 
   if (!post) {
     return null;
   }
 
-  const canSubmit = replyText.trim().length > 0;
-  const isOwnPost = post.handle === currentUserHandle;
+  const canSubmit = replyText.trim().length > 0 && !sending;
+  const isOwnPost = post.userId === currentUserId;
 
-  const handleSend = () => {
-    if (!canSubmit) {
+  const handleSend = async () => {
+    if (!canSubmit || !currentUserId) {
       return;
     }
-    onSubmitReply(post.id, replyText.trim());
+    setSending(true);
+    const text = replyText.trim();
     setReplyText('');
+    const ok = await addReplyDb(post.id, currentUserId, text);
+    if (ok) {
+      const rows = await fetchReplies(post.id);
+      setReplies(rows);
+      // Keep the feed card's badge (and "No replies yet" text) in sync the
+      // instant a reply lands, instead of only on the modal's own state.
+      onReplyCountChange(post.id, rows.length);
+    } else {
+      setReplyText(text);
+    }
+    setSending(false);
   };
 
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
       <View style={styles.overlayFill}>
-        {/* True backdrop is a sibling of the KAV/content, never an ancestor
-            wrapping it, so it can't compete with the ScrollView's own pan
-            responder — vertical swipes strictly scroll, never dismiss. */}
         <Pressable style={styles.modalBackdropFill} onPress={onClose} />
         <KeyboardAvoidingView
           style={styles.overlayFlex}
@@ -1913,13 +3075,15 @@ function PostDetailModal({
 
               <View style={styles.overlayCard}>
                 <View style={styles.feedTopRow}>
-                  <Avatar handle={post.handle} profilePictureUrl={post.profilePictureUrl} size={32} />
+                  <Avatar handle={post.authorUsername} size={32} />
                   <Text style={styles.feedHandle} numberOfLines={1} ellipsizeMode="tail">
-                    {post.handle}
+                    {post.authorUsername}
                   </Text>
-                  <Text style={styles.feedLevelTag}>[LVL {post.level}]</Text>
+                  <Text style={styles.feedLevelTag} numberOfLines={1}>
+                    [{post.authorRank.toUpperCase()}]
+                  </Text>
                   <Text style={styles.feedTimestamp} numberOfLines={1} ellipsizeMode="tail">
-                    {post.timestamp}
+                    {relativeTime(post.createdAt)}
                   </Text>
                 </View>
                 <Text style={styles.feedTitle} numberOfLines={2} ellipsizeMode="tail">
@@ -1928,11 +3092,7 @@ function PostDetailModal({
                 <Text style={styles.bodyText}>{post.body}</Text>
 
                 <View style={styles.feedBottomRow}>
-                  <Pressable
-                    onPress={() => onToggleLike(post.id)}
-                    style={styles.likeButton}
-                    hitSlop={8}
-                  >
+                  <Pressable onPress={() => onToggleLike(post.id)} style={styles.likeButton} hitSlop={8}>
                     <Text style={[styles.likeIcon, post.liked && styles.likeIconActive]}>
                       {post.liked ? '\u2665' : '\u2661'}
                     </Text>
@@ -1945,46 +3105,53 @@ function PostDetailModal({
                     <Text style={styles.viewCountText}>{post.viewCount} views</Text>
                   </View>
                 </View>
+
+                {/* Step 5.4: moderation controls (hidden on your own post). */}
+                {!isOwnPost ? (
+                  <View style={styles.moderationRow}>
+                    <Pressable
+                      onPress={() => setReportVisible(true)}
+                      style={({ pressed }) => [styles.moderationBtn, pressed && styles.cardPressed]}
+                    >
+                      <Text style={styles.moderationBtnText}>{'\u26A0'}  REPORT</Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={() => onBlock(post)}
+                      style={({ pressed }) => [styles.moderationBtn, pressed && styles.cardPressed]}
+                    >
+                      <Text style={styles.moderationBtnText}>{'\u2298'}  BLOCK</Text>
+                    </Pressable>
+                  </View>
+                ) : null}
               </View>
 
-              <SectionHeader label={`REPLIES (${post.replies.length})`} />
+              <SectionHeader label={`REPLIES (${replies.length})`} />
 
-              {post.replies.length === 0 ? (
+              {loadingReplies ? (
+                <View style={styles.overlayCard}>
+                  <ActivityIndicator color={COLORS.neon} />
+                </View>
+              ) : replies.length === 0 ? (
                 <View style={styles.overlayCard}>
                   <Text style={styles.bodyText}>
                     No replies yet. Be the first to reinforce this operator.
                   </Text>
                 </View>
               ) : (
-                post.replies.map((reply) => (
+                replies.map((reply) => (
                   <View key={reply.id} style={styles.replyCard}>
                     <View style={styles.replyHeaderRow}>
                       <View style={styles.replyHandleRow}>
-                        <Avatar
-                          handle={reply.handle}
-                          profilePictureUrl={reply.profilePictureUrl}
-                          size={22}
-                        />
+                        <Avatar handle={withAt(reply.author_username)} size={22} />
                         <Text style={styles.replyHandle} numberOfLines={1} ellipsizeMode="tail">
-                          {reply.handle}
+                          {withAt(reply.author_username)}
                         </Text>
                       </View>
-                      <Pressable
-                        onPress={() => onToggleReplyLike(post.id, reply.id)}
-                        style={styles.likeButton}
-                        hitSlop={8}
-                      >
-                        <Text style={[styles.likeIcon, reply.liked && styles.likeIconActive]}>
-                          {reply.liked ? '\u2665' : '\u2661'}
-                        </Text>
-                        <Text
-                          style={[styles.likeCountText, reply.liked && styles.likeCountTextActive]}
-                        >
-                          {reply.likeCount}
-                        </Text>
-                      </Pressable>
+                      <Text style={styles.feedTimestamp} numberOfLines={1}>
+                        {relativeTime(reply.created_at)}
+                      </Text>
                     </View>
-                    <Text style={styles.bodyText}>{reply.text}</Text>
+                    <Text style={styles.bodyText}>{reply.content}</Text>
                   </View>
                 ))
               )}
@@ -2000,12 +3167,8 @@ function PostDetailModal({
                   placeholderTextColor={COLORS.muted}
                   textAlignVertical="top"
                   keyboardAppearance="dark"
+                  editable={!sending}
                 />
-                {!isOwnPost && (
-                  <Text style={styles.charCounter}>
-                    Sending a reply awards +{SUPPORT_SCORE_REWARD} Support Score.
-                  </Text>
-                )}
               </View>
 
               <View
@@ -2020,13 +3183,24 @@ function PostDetailModal({
                     pressed && styles.primaryButtonPressed,
                   ]}
                 >
-                  <Text style={styles.primaryButtonText}>{'\u27A4'}  SEND SUPPORT REPLY</Text>
+                  <Text style={styles.primaryButtonText}>
+                    {sending ? 'SENDING...' : '\u27A4  SEND SUPPORT REPLY'}
+                  </Text>
                 </Pressable>
               </View>
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
       </View>
+
+      <ReportModal
+        visible={reportVisible}
+        onClose={() => setReportVisible(false)}
+        onSubmit={(reason) => {
+          setReportVisible(false);
+          onReport(post, reason);
+        }}
+      />
     </Modal>
   );
 }
@@ -2146,33 +3320,42 @@ function CreatePostModal({
 
 function CommunityScreen() {
   const insets = useSafeAreaInsets();
+  const { user } = useAuth();
+  const { profile } = useProfile();
+  const currentUserId = user?.id ?? null;
   const {
-    userProfile,
     communityFeed,
-    addReply,
-    addStandalonePost,
-    toggleLike,
-    toggleReplyLike,
-    registerPostView,
+    feedLoading,
+    refreshFeed,
+    likePost,
+    reportPost,
+    blockAuthor,
+    registerView,
+    createPost,
+    setReplyCount,
   } = useAppContext();
-  const [inspectedPost, setInspectedPost] = useState<FeedPost | null>(null);
+  const { openChatWith } = useMessaging();
+  const [inspectedPost, setInspectedPost] = useState<CommunityPost | null>(null);
   const [openPostId, setOpenPostId] = useState<string | null>(null);
   const [createPostVisible, setCreatePostVisible] = useState(false);
 
-  // Re-derive the open post from the live feed on every render so the modal
-  // reflects newly added replies/likes immediately instead of a stale
-  // snapshot.
+  // Re-derive the open post from the live feed each render so the modal
+  // reflects newly added likes/counts immediately.
   const activeOpenPost = openPostId
     ? communityFeed.find((post) => post.id === openPostId) ?? null
     : null;
 
-  // Requirement (Point 2): register a "view" for the current user exactly
-  // once per post — repeat opens by the same user never inflate the count.
+  const rankLabel = profile?.rank_title ? `RANK: ${profile.rank_title.toUpperCase()}` : 'RANK: ---';
+
+  // Step 5.2: register a view for the current user exactly once per post per
+  // session (server dedups permanently); repeat opens never re-fire.
+  const viewedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (openPostId) {
-      registerPostView(openPostId, userProfile.handle);
+    if (openPostId && !viewedRef.current.has(openPostId)) {
+      viewedRef.current.add(openPostId);
+      registerView(openPostId);
     }
-  }, [openPostId, registerPostView, userProfile.handle]);
+  }, [openPostId, registerView]);
 
   const scrollY = useSharedValue(0);
   const onScroll = useAnimatedScrollHandler((event) => {
@@ -2190,6 +3373,8 @@ function CommunityScreen() {
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
         showsVerticalScrollIndicator={false}
+        onRefresh={refreshFeed}
+        refreshing={feedLoading}
         contentContainerStyle={[
           styles.screenScroll,
           {
@@ -2199,16 +3384,27 @@ function CommunityScreen() {
         ]}
         ListHeaderComponent={
           <View>
-            <TierBanner level={userProfile.level} />
+            <TierBanner label={rankLabel} />
             <SectionHeader label="ACTION REPORT TIMELINE" />
           </View>
+        }
+        ListEmptyComponent={
+          feedLoading ? (
+            <ActivityIndicator color={COLORS.neon} style={styles.messagesSpinner} />
+          ) : (
+            <View style={styles.card}>
+              <Text style={styles.bodyText}>
+                The grid is quiet. Complete a challenge and broadcast it to start the timeline.
+              </Text>
+            </View>
+          )
         }
         renderItem={({ item }) => (
           <FeedCard
             post={item}
             onPressHandle={setInspectedPost}
             onPressPost={(post) => setOpenPostId(post.id)}
-            onToggleLike={toggleLike}
+            onToggleLike={likePost}
           />
         )}
       />
@@ -2224,22 +3420,38 @@ function CommunityScreen() {
         <Text style={styles.fabLabel}>NEW POST</Text>
       </SpringPressable>
 
-      <InspectProfileModal post={inspectedPost} onClose={() => setInspectedPost(null)} />
+      <InspectProfileModal
+        post={inspectedPost}
+        currentUserId={currentUserId}
+        onClose={() => setInspectedPost(null)}
+        onMessage={(post) => {
+          setInspectedPost(null);
+          openChatWith(post.userId, post.authorUsername, post.authorRank);
+        }}
+        onBlock={(post) => {
+          setInspectedPost(null);
+          blockAuthor(post.userId);
+        }}
+      />
 
       <PostDetailModal
         post={activeOpenPost}
-        currentUserHandle={userProfile.handle}
+        currentUserId={currentUserId}
         onClose={() => setOpenPostId(null)}
-        onSubmitReply={addReply}
-        onToggleLike={toggleLike}
-        onToggleReplyLike={toggleReplyLike}
+        onToggleLike={likePost}
+        onReport={(post, reason) => reportPost(post.id, post.userId, reason)}
+        onBlock={(post) => {
+          setOpenPostId(null);
+          blockAuthor(post.userId);
+        }}
+        onReplyCountChange={setReplyCount}
       />
 
       <CreatePostModal
         visible={createPostVisible}
         onClose={() => setCreatePostVisible(false)}
-        onSubmit={(title, body) => {
-          addStandalonePost(title, body);
+        onSubmit={async (title, body) => {
+          await createPost(title, body);
           setCreatePostVisible(false);
         }}
       />
@@ -2259,7 +3471,7 @@ function JournalEntryCard({
   expanded,
   onToggle,
 }: {
-  entry: JournalEntry;
+  entry: JournalItem;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -2270,13 +3482,17 @@ function JournalEntryCard({
     >
       <View style={styles.journalMetaRow}>
         <Text style={styles.journalDate} numberOfLines={1} ellipsizeMode="tail">
-          {entry.date}
+          {formatIsoDate(entry.createdAt)}
         </Text>
-        <Text style={styles.journalTier}>[ TIER: LVL {entry.level} ]</Text>
+        {entry.challengeTitle ? (
+          <Text style={styles.journalTier} numberOfLines={1} ellipsizeMode="tail">
+            {entry.challengeTitle}
+          </Text>
+        ) : null}
       </View>
       <View style={styles.questDivider} />
       <Text style={styles.bodyText} numberOfLines={expanded ? undefined : 3} ellipsizeMode="tail">
-        {entry.text}
+        {entry.content}
       </Text>
       <Text style={styles.tapHintText}>{expanded ? 'TAP TO COLLAPSE' : 'TAP TO EXPAND'}</Text>
     </Pressable>
@@ -2287,6 +3503,159 @@ function JournalEntryCard({
 // layout of the Community feed — chronological entries with a true
 // infinite-scroll archive loader (FlatList + onEndReached) and per-entry
 // expansion — with zero social features (no likes/views/replies).
+// Free-form personal journal entry — no challenge required. Same anti-spam
+// validation as the challenge readout (60 char min, word/character
+// diversity checks) and the same submit-cooldown pattern; the write itself
+// is routed through add_journal_entry(), a SECURITY DEFINER RPC, since the
+// journal_entries table grants zero direct client writes.
+function NewJournalEntryModal({
+  visible,
+  onClose,
+}: {
+  visible: boolean;
+  onClose: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const { addPersonalJournalEntry } = useAppContext();
+  const [titleText, setTitleText] = useState('');
+  const [entryText, setEntryText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [errorText, setErrorText] = useState('');
+  const cooldownAnim = useRef(new Animated.Value(0)).current;
+
+  const analysis = analyzeJournalEntry(entryText);
+  const isValid = analysis.valid;
+  const canSubmit = isValid && !submitting;
+
+  useEffect(() => {
+    if (!visible) {
+      setTitleText('');
+      setEntryText('');
+      setSubmitting(false);
+      setErrorText('');
+      cooldownAnim.setValue(0);
+    }
+  }, [visible, cooldownAnim]);
+
+  const handleSubmit = async () => {
+    if (!canSubmit) {
+      return;
+    }
+    setSubmitting(true);
+    setErrorText('');
+    cooldownAnim.setValue(0);
+    Animated.timing(cooldownAnim, {
+      toValue: 1,
+      duration: SUBMIT_COOLDOWN_MS,
+      easing: Easing.linear,
+      useNativeDriver: false,
+    }).start();
+
+    const result = await addPersonalJournalEntry(entryText.trim(), titleText.trim());
+    if (result.ok) {
+      onClose();
+    } else {
+      setErrorText(result.error ?? 'Could not save entry. Try again.');
+    }
+    setTimeout(() => setSubmitting(false), SUBMIT_COOLDOWN_MS);
+  };
+
+  if (!visible) {
+    return null;
+  }
+
+  const cooldownWidth = cooldownAnim.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] });
+
+  return (
+    <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.overlayFill}>
+        <Pressable style={styles.modalBackdropFill} onPress={onClose} />
+        <KeyboardAvoidingView
+          style={styles.overlayFlex}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          pointerEvents="box-none"
+        >
+          <View
+            pointerEvents="box-none"
+            style={[
+              styles.overlayInner,
+              { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 24 },
+            ]}
+          >
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              contentContainerStyle={styles.overlayScrollContent}
+              showsVerticalScrollIndicator={false}
+            >
+              <Pressable onPress={onClose} style={styles.cancelButton}>
+                <Text style={styles.cancelButtonText}>{'\u2715'}  CANCEL — DISCARD ENTRY</Text>
+              </Pressable>
+
+              <SectionHeader label="NEW PERSONAL LOG" centered />
+
+              <View style={styles.overlayCard}>
+                <Text style={styles.broadcastTitleLabel}>TITLE (OPTIONAL)</Text>
+                <TextInput
+                  style={styles.titleInput}
+                  value={titleText}
+                  onChangeText={setTitleText}
+                  placeholder="Give this entry a title..."
+                  placeholderTextColor={COLORS.muted}
+                  maxLength={80}
+                  editable={!submitting}
+                  keyboardAppearance="dark"
+                />
+              </View>
+
+              <View style={styles.overlayCard}>
+                <TextInput
+                  style={styles.verificationInput}
+                  multiline
+                  value={entryText}
+                  onChangeText={setEntryText}
+                  placeholder="Write a private reflection — no challenge required..."
+                  placeholderTextColor={COLORS.muted}
+                  textAlignVertical="top"
+                  keyboardAppearance="dark"
+                  editable={!submitting}
+                />
+                <Text style={[styles.charCounter, isValid && styles.charCounterValid]}>
+                  {analysis.status}
+                </Text>
+              </View>
+
+              {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
+
+              <View
+                pointerEvents={canSubmit ? 'auto' : 'none'}
+                style={{ opacity: isValid ? 1 : 0.4 }}
+              >
+                <Pressable
+                  onPress={handleSubmit}
+                  style={({ pressed }) => [
+                    styles.primaryButton,
+                    styles.submitCooldownButton,
+                    !isValid && styles.primaryButtonDisabled,
+                    pressed && !submitting && styles.primaryButtonPressed,
+                  ]}
+                >
+                  {submitting ? (
+                    <Animated.View style={[styles.submitCooldownFill, { width: cooldownWidth }]} />
+                  ) : null}
+                  <Text style={styles.primaryButtonText}>
+                    {submitting ? 'SAVING...' : '\u25C6  SAVE TO JOURNAL'}
+                  </Text>
+                </Pressable>
+              </View>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </View>
+    </Modal>
+  );
+}
+
 function JournalModal({
   visible,
   onClose,
@@ -2294,12 +3663,13 @@ function JournalModal({
 }: {
   visible: boolean;
   onClose: () => void;
-  journals: JournalEntry[];
+  journals: JournalItem[];
 }) {
   const insets = useSafeAreaInsets();
   const [visibleCount, setVisibleCount] = useState(JOURNAL_PAGE_SIZE);
   const [loadingMore, setLoadingMore] = useState(false);
   const [expandedEntryIds, setExpandedEntryIds] = useState<Set<string>>(new Set());
+  const [newEntryVisible, setNewEntryVisible] = useState(false);
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -2307,6 +3677,7 @@ function JournalModal({
       setVisibleCount(JOURNAL_PAGE_SIZE);
       setExpandedEntryIds(new Set());
       setLoadingMore(false);
+      setNewEntryVisible(false);
       if (loadTimeoutRef.current) {
         clearTimeout(loadTimeoutRef.current);
         loadTimeoutRef.current = null;
@@ -2378,6 +3749,16 @@ function JournalModal({
                 <Pressable onPress={onClose} style={styles.abortButton}>
                   <Text style={styles.abortButtonText}>{'\u2715'}  CLOSE JOURNAL</Text>
                 </Pressable>
+                <Pressable
+                  onPress={() => setNewEntryVisible(true)}
+                  style={({ pressed }) => [
+                    styles.primaryButton,
+                    styles.newEntryButton,
+                    pressed && styles.primaryButtonPressed,
+                  ]}
+                >
+                  <Text style={styles.primaryButtonText}>{'+'}  NEW JOURNAL ENTRY</Text>
+                </Pressable>
                 <SectionHeader label="PERSONAL LOG — TIMELINE ARCHIVE" centered />
               </View>
             }
@@ -2401,24 +3782,37 @@ function JournalModal({
           />
         </View>
       </View>
+
+      <NewJournalEntryModal visible={newEntryVisible} onClose={() => setNewEntryVisible(false)} />
     </Modal>
   );
 }
 
 function ProfileScreen() {
   const insets = useSafeAreaInsets();
-  const { userProfile, userJournals } = useAppContext();
+  const { journalEntries } = useAppContext();
+  const { profile, isLoading: profileLoading } = useProfile();
   const [journalVisible, setJournalVisible] = useState(false);
   const [identityModalVisible, setIdentityModalVisible] = useState(false);
   const [socialModalVisible, setSocialModalVisible] = useState(false);
-  const [supportModalVisible, setSupportModalVisible] = useState(false);
 
-  const initials = userProfile.handle
+  const loading = profileLoading || !profile;
+  const socialScoreLabel = loading ? '---' : String(profile.social_score);
+  const streakLabel = loading ? '---' : String(profile.streak_count);
+  const rankTitle = loading ? 'Starter' : profile.rank_title || 'Starter';
+  const usernameRaw = profile?.username ?? '';
+  const handleLabel = loading
+    ? '---'
+    : usernameRaw
+      ? withAt(usernameRaw)
+      : '—';
+
+  const initials = usernameRaw
     .replace('@', '')
-    .split('_')
+    .split(/[_\s]/)
     .map((part) => part.charAt(0).toUpperCase())
     .join('')
-    .slice(0, 2);
+    .slice(0, 2) || 'OP';
 
   const scrollY = useSharedValue(0);
   const onScroll = useAnimatedScrollHandler((event) => {
@@ -2442,11 +3836,10 @@ function ProfileScreen() {
         ]}
         showsVerticalScrollIndicator={false}
       >
-        <TierBanner level={userProfile.level} />
+        <TierBanner label={`RANK: ${rankTitle.toUpperCase()}`} />
 
-        {/* Requirement (Point 7): every informational section is now an
-            interactive, clickable card with haptic feedback that opens a
-            dedicated popup with deeper detail. */}
+        {/* Every informational section is an interactive card with haptic
+            feedback that opens a popup with deeper detail. */}
         <SpringPressable
           onPress={() => {
             triggerHaptic();
@@ -2459,11 +3852,11 @@ function ProfileScreen() {
             <Text style={styles.avatarText}>{initials}</Text>
           </View>
           <Text style={styles.identityHandle} numberOfLines={1} ellipsizeMode="tail">
-            {userProfile.handle}
+            {handleLabel}
           </Text>
           <View style={styles.streakBadge}>
             <Text style={styles.streakBadgeText}>
-              {'\u25B2'} STREAK: {userProfile.streak} DAYS UNBROKEN
+              {'\u25B2'} STREAK: {streakLabel} DAYS UNBROKEN
             </Text>
           </View>
           <Text style={styles.tapHintText}>TAP FOR ACCOUNT OVERVIEW</Text>
@@ -2481,25 +3874,9 @@ function ProfileScreen() {
             <Text style={styles.gridHeader} numberOfLines={2} ellipsizeMode="tail">
               SOCIAL FITNESS SCORE
             </Text>
-            <Text style={styles.gridScore}>{userProfile.socialScore}</Text>
+            <Text style={styles.gridScore}>{socialScoreLabel}</Text>
             <Text style={styles.gridSubtext}>
-              Points accumulated via real-world social friction.
-            </Text>
-          </SpringPressable>
-          <SpringPressable
-            onPress={() => {
-              triggerHaptic();
-              setSupportModalVisible(true);
-            }}
-            containerStyle={styles.gridBlockContainer}
-            style={({ pressed }) => [styles.card, styles.gridBlock, pressed && styles.cardPressed]}
-          >
-            <Text style={styles.gridHeader} numberOfLines={2} ellipsizeMode="tail">
-              COMMUNITY SUPPORT SCORE
-            </Text>
-            <Text style={styles.gridScore}>{userProfile.supportScore}</Text>
-            <Text style={styles.gridSubtext}>
-              Points accumulated via direct peer reinforcement.
+              Points accumulated via real-world social friction and community support.
             </Text>
           </SpringPressable>
         </View>
@@ -2518,7 +3895,7 @@ function ProfileScreen() {
           <View style={styles.journalNavTextBlock}>
             <Text style={styles.journalNavTitle}>JOURNAL</Text>
             <Text style={styles.journalNavSubtext} numberOfLines={2} ellipsizeMode="tail">
-              {userJournals.length} logged reflections — tap to review your timeline archive.
+              {journalEntries.length} logged reflections — tap to review your timeline archive.
             </Text>
           </View>
           <Text style={styles.accordionChevron}>{'\u203A'}</Text>
@@ -2530,7 +3907,7 @@ function ProfileScreen() {
       <JournalModal
         visible={journalVisible}
         onClose={() => setJournalVisible(false)}
-        journals={userJournals}
+        journals={journalEntries}
       />
 
       <InfoPopupModal
@@ -2539,10 +3916,12 @@ function ProfileScreen() {
         title="ACCOUNT OVERVIEW"
       >
         <Text style={styles.bodyText}>
-          Operator {userProfile.handle} is currently Level {userProfile.level} with an unbroken
-          streak of {userProfile.streak} days. Every verified quest and community reply feeds
-          directly into the Social and Support scores below.
+          Operator {handleLabel} currently holds the {rankTitle} rank with an unbroken streak of{' '}
+          {streakLabel} days. Every verified challenge feeds directly into the single Social Score
+          below.
         </Text>
+        <AccountEditSection />
+        <DevTestPanel />
       </InfoPopupModal>
 
       <InfoPopupModal
@@ -2551,20 +3930,9 @@ function ProfileScreen() {
         title="SOCIAL SCORE BREAKDOWN"
       >
         <Text style={styles.bodyText}>
-          Points accumulated via real-world social friction. Every verified quest submission
-          awards +{SOCIAL_SCORE_REWARD} Social Score — current total: {userProfile.socialScore}.
-        </Text>
-      </InfoPopupModal>
-
-      <InfoPopupModal
-        visible={supportModalVisible}
-        onClose={() => setSupportModalVisible(false)}
-        title="SUPPORT SCORE BREAKDOWN"
-      >
-        <Text style={styles.bodyText}>
-          Points accumulated via direct peer reinforcement. Replying to another operator&apos;s
-          field report awards +{SUPPORT_SCORE_REWARD} Support Score — current total:{' '}
-          {userProfile.supportScore}.
+          Your single progression metric. Points accumulate via real-world social friction and
+          direct peer reinforcement — every verified challenge submission awards its listed XP.
+          Current total: {socialScoreLabel}.
         </Text>
       </InfoPopupModal>
     </View>
@@ -2581,14 +3949,24 @@ function ProfileScreen() {
 
 function ProgressScreen() {
   const insets = useSafeAreaInsets();
-  const { userProfile, userJournals, communityFeed } = useAppContext();
+  const { journalEntries, completedCount } = useAppContext();
+  const { profile, isLoading: profileLoading } = useProfile();
   const [lockModalVisible, setLockModalVisible] = useState(false);
 
-  const socialRatio = userProfile.socialScore / MAX_SOCIAL_SCORE;
-  const supportRatio = userProfile.supportScore / MAX_SUPPORT_SCORE;
-  const broadcastCount = communityFeed.filter(
-    (post) => post.handle === userProfile.handle,
-  ).length;
+  const loading = profileLoading || !profile;
+  const socialScore = profile?.social_score ?? 0;
+  // Step 6.3 live bindings.
+  const rankTitle = loading ? 'Starter' : profile?.rank_title || 'Starter';
+  const { ratio: socialRatio, target: nextRankTarget } = computeRankProgress(rankTitle, socialScore);
+  const socialScoreLabel = loading ? '---' : String(socialScore);
+  const socialTargetLabel = nextRankTarget === null ? 'MAX' : String(nextRankTarget);
+  const socialPctLabel = loading
+    ? '---'
+    : nextRankTarget === null
+      ? 'Max rank reached'
+      : `${Math.round(socialRatio * 100)}% to next tier`;
+  const streakLabel = loading ? '---' : String(profile.streak_count);
+  const questsCompletedLabel = loading ? '---' : String(completedCount);
 
   const scrollY = useSharedValue(0);
   const onScroll = useAnimatedScrollHandler((event) => {
@@ -2617,45 +3995,27 @@ function ProgressScreen() {
           <View style={styles.progressMetricHeaderRow}>
             <Text style={styles.growthMetricLabel}>SOCIAL GROWTH</Text>
             <Text style={styles.progressMetricValue}>
-              {userProfile.socialScore}
-              <Text style={styles.growthMetricMax}> / {MAX_SOCIAL_SCORE}</Text>
+              {socialScoreLabel}
+              <Text style={styles.growthMetricMax}> / {socialTargetLabel}</Text>
             </Text>
           </View>
-          <ProgressBar ratio={socialRatio} />
-          <Text style={styles.progressMetricPct}>{Math.round(socialRatio * 100)}% to next tier</Text>
-
-          <View style={styles.progressMetricDivider} />
-
-          <View style={styles.progressMetricHeaderRow}>
-            <Text style={styles.growthMetricLabel}>SUPPORT GROWTH</Text>
-            <Text style={styles.progressMetricValue}>
-              {userProfile.supportScore}
-              <Text style={styles.growthMetricMax}> / {MAX_SUPPORT_SCORE}</Text>
-            </Text>
-          </View>
-          <ProgressBar ratio={supportRatio} />
-          <Text style={styles.progressMetricPct}>{Math.round(supportRatio * 100)}% to next tier</Text>
+          <ProgressBar ratio={loading ? 0 : socialRatio} />
+          <Text style={styles.progressMetricPct}>{socialPctLabel}</Text>
         </View>
 
         <SectionHeader label="MILESTONES" />
         <View style={styles.card}>
           <View style={styles.vitalsRow}>
-            <Text style={styles.vitalsLabel}>GROWTH STAGE</Text>
-            <Text style={styles.vitalsValue}>
-              {userProfile.level} — {getStageTitle(userProfile.level).toUpperCase()}
-            </Text>
+            <Text style={styles.vitalsLabel}>GROWTH STAGE / RANK</Text>
+            <Text style={styles.vitalsValue}>{rankTitle.toUpperCase()}</Text>
           </View>
           <View style={styles.vitalsRow}>
             <Text style={styles.vitalsLabel}>UNBROKEN STREAK</Text>
-            <Text style={styles.vitalsValue}>{userProfile.streak} DAYS</Text>
-          </View>
-          <View style={styles.vitalsRow}>
-            <Text style={styles.vitalsLabel}>QUESTS COMPLETED</Text>
-            <Text style={styles.vitalsValue}>{userJournals.length}</Text>
+            <Text style={styles.vitalsValue}>{streakLabel} DAYS</Text>
           </View>
           <View style={[styles.vitalsRow, styles.vitalsRowLast]}>
-            <Text style={styles.vitalsLabel}>REPORTS BROADCAST</Text>
-            <Text style={styles.vitalsValue}>{broadcastCount}</Text>
+            <Text style={styles.vitalsLabel}>QUESTS COMPLETED</Text>
+            <Text style={styles.vitalsValue}>{questsCompletedLabel}</Text>
           </View>
         </View>
 
@@ -2667,22 +4027,26 @@ function ProgressScreen() {
         />
 
         <SectionHeader label="COMPLETED QUEST ARCHIVE" />
-        {userJournals.length === 0 ? (
+        {journalEntries.length === 0 ? (
           <View style={styles.card}>
             <Text style={styles.bodyText}>
               No completed quests logged yet. Clear a challenge to start your archive.
             </Text>
           </View>
         ) : (
-          userJournals.map((entry) => (
+          journalEntries.map((entry) => (
             <View key={entry.id} style={styles.card}>
               <View style={styles.journalMetaRow}>
-                <Text style={styles.journalDate}>{entry.date}</Text>
-                <Text style={styles.journalTier}>LEVEL {entry.level}</Text>
+                <Text style={styles.journalDate}>{formatIsoDate(entry.createdAt)}</Text>
+                {entry.challengeTitle ? (
+                  <Text style={styles.journalTier} numberOfLines={1} ellipsizeMode="tail">
+                    {entry.challengeTitle}
+                  </Text>
+                ) : null}
               </View>
               <View style={styles.growthDivider} />
               <Text style={styles.bodyText} numberOfLines={3} ellipsizeMode="tail">
-                {entry.text}
+                {entry.content}
               </Text>
             </View>
           ))
@@ -2796,15 +4160,32 @@ function RootTabs() {
 // ============================================================================
 
 export default function App() {
+  const [fontsLoaded, fontError] = useFonts({
+    DMSans_400Regular,
+    DMSans_600SemiBold,
+    DMSans_700Bold,
+    DMSans_800ExtraBold,
+  });
+
+  // Gate render until fonts resolve; on font error we still render (nodes fall
+  // back to the system font) so a font CDN hiccup never blocks the app.
+  if (!fontsLoaded && !fontError) {
+    return null;
+  }
+
   return (
     <SafeAreaProvider>
       <AuthProvider>
-        <AppProvider>
-          <NavigationContainer theme={navTheme}>
-            <StatusBar style="light" />
-            <RootTabs />
-          </NavigationContainer>
-        </AppProvider>
+        <ProfileProvider>
+          <AppProvider>
+            <MessagingProvider>
+              <NavigationContainer theme={navTheme}>
+                <StatusBar style="light" />
+                <RootTabs />
+              </NavigationContainer>
+            </MessagingProvider>
+          </AppProvider>
+        </ProfileProvider>
       </AuthProvider>
     </SafeAreaProvider>
   );
@@ -2875,10 +4256,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   headerPillNumber: {
-    fontFamily: DISPLAY,
+    fontFamily: DM_SANS_HEAVY,
     color: COLORS.body,
     fontSize: 14,
     fontWeight: '800',
+    minWidth: 16,
+    textAlign: 'center',
   },
   headerStreakBadge: {
     flexDirection: 'row',
@@ -3370,6 +4753,50 @@ const styles = StyleSheet.create({
   },
   charCounterValid: {
     color: COLORS.neon,
+  },
+  accountEditBlock: {
+    width: '100%',
+    marginTop: 4,
+  },
+  accountEditLabel: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.muted,
+    fontSize: 11,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  accountEditInput: {
+    minHeight: 44,
+    borderWidth: 1,
+    borderColor: COLORS.divider,
+    backgroundColor: COLORS.canvas,
+    borderRadius: 12,
+    color: COLORS.body,
+    fontFamily: SANS,
+    fontSize: 14,
+    padding: 12,
+  },
+  accountEditBioInput: {
+    minHeight: 80,
+    textAlignVertical: 'top',
+  },
+  accountEditCounter: {
+    fontFamily: MONO,
+    color: COLORS.muted,
+    fontSize: 11,
+    marginTop: 6,
+    textAlign: 'right',
+  },
+  accountEditHint: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 8,
+  },
+  accountEditSaveButton: {
+    marginTop: 12,
+    marginBottom: 4,
   },
   toggleRow: {
     flexDirection: 'row',
@@ -3911,7 +5338,7 @@ const styles = StyleSheet.create({
     lineHeight: 38,
   },
   growthStageTitle: {
-    fontFamily: DISPLAY,
+    fontFamily: DM_SANS_BOLD,
     color: COLORS.neon,
     fontSize: 15,
     fontWeight: '700',
@@ -3943,7 +5370,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   growthMetricLabel: {
-    fontFamily: DISPLAY,
+    fontFamily: DM_SANS_BOLD,
     color: COLORS.muted,
     fontSize: 11,
     fontWeight: '700',
@@ -3952,7 +5379,7 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   growthMetricValue: {
-    fontFamily: DISPLAY,
+    fontFamily: DM_SANS_HEAVY,
     color: COLORS.body,
     fontSize: 17,
     fontWeight: '800',
@@ -3960,13 +5387,13 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   growthMetricMax: {
-    fontFamily: SANS,
+    fontFamily: DM_SANS,
     color: COLORS.muted,
     fontSize: 12,
     fontWeight: '600',
   },
   growthMetricPct: {
-    fontFamily: SANS,
+    fontFamily: DM_SANS,
     color: COLORS.neon,
     fontSize: 12,
     fontWeight: '700',
@@ -4099,7 +5526,7 @@ const styles = StyleSheet.create({
     fontSize: 28,
   },
   streakNumber: {
-    fontFamily: DISPLAY,
+    fontFamily: DM_SANS_HEAVY,
     color: COLORS.body,
     fontSize: 26,
     fontWeight: '800',
@@ -4107,10 +5534,29 @@ const styles = StyleSheet.create({
     lineHeight: 28,
   },
   streakCaption: {
-    fontFamily: SANS,
+    fontFamily: DM_SANS,
     color: COLORS.muted,
     fontSize: 12,
     marginTop: 2,
+  },
+
+  // ---- Home body: operator identity slot (username + bio) --------------------
+  identitySlotCard: {
+    paddingVertical: 14,
+  },
+  identitySlotUsername: {
+    fontFamily: DM_SANS_HEAVY,
+    color: COLORS.body,
+    fontSize: 18,
+    fontWeight: '800',
+    letterSpacing: -0.3,
+  },
+  identitySlotBio: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 4,
   },
   streakDays: {
     flexDirection: 'row',
@@ -4202,9 +5648,351 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: 8,
   },
-  progressMetricDivider: {
-    height: 1,
-    backgroundColor: COLORS.divider,
-    marginVertical: 18,
+
+  // ---- Header message pill (Step 6.2) --------------------------------------
+  headerPillButton: {
+    backgroundColor: COLORS.surface,
+  },
+  headerPillPressed: {
+    opacity: 0.6,
+  },
+
+  // ---- Journal completion modal: broadcast + cooldown (Step 2) -------------
+  broadcastTitleBlock: {
+    marginTop: 12,
+  },
+  broadcastTitleLabel: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.muted,
+    fontSize: 11,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  submitCooldownButton: {
+    overflow: 'hidden',
+  },
+  submitCooldownFill: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: COLORS.glow,
+  },
+  newEntryButton: {
+    marginBottom: 16,
+  },
+  errorText: {
+    fontFamily: DM_SANS,
+    color: '#FF6B6B',
+    fontSize: 13,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+
+  // ---- Home tab personal journal feed (Step 4) -----------------------------
+  journalFeedCard: {
+    marginBottom: 12,
+  },
+  journalFeedEmpty: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 20,
+  },
+  journalFeedDate: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.muted,
+    fontSize: 11,
+    letterSpacing: 0.6,
+  },
+  journalFeedTag: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.neon,
+    fontSize: 11,
+    letterSpacing: 0.4,
+    flexShrink: 1,
+    textAlign: 'right',
+    marginLeft: 8,
+  },
+  journalFeedText: {
+    fontFamily: DM_SANS,
+    color: COLORS.body,
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 8,
+  },
+
+  // ---- Moderation: report + block (Step 5) ---------------------------------
+  dangerButton: {
+    backgroundColor: 'rgba(220, 38, 38, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(220, 38, 38, 0.5)',
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dangerButtonText: {
+    fontFamily: DM_SANS_BOLD,
+    color: '#FCA5A5',
+    fontSize: 13,
+    letterSpacing: 0.6,
+  },
+  reportReasonList: {
+    marginTop: 8,
+  },
+  reportReasonRow: {
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    marginBottom: 10,
+  },
+  reportReasonText: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.body,
+    fontSize: 14,
+  },
+  moderationRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 14,
+  },
+  moderationBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  moderationBtnText: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.muted,
+    fontSize: 12,
+    letterSpacing: 0.6,
+  },
+
+  // ---- Messaging overlay (Step 6) ------------------------------------------
+  messagesHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+    gap: 12,
+  },
+  messagesTitle: {
+    fontFamily: DM_SANS_HEAVY,
+    color: COLORS.body,
+    fontSize: 20,
+    letterSpacing: 0.5,
+    flex: 1,
+  },
+  messagesCloseBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+  },
+  messagesCloseText: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.muted,
+    fontSize: 12,
+    letterSpacing: 0.6,
+  },
+  messagesBackText: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.neon,
+    fontSize: 13,
+    letterSpacing: 0.4,
+  },
+  messagesHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  messagesNewGroupBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.emerald,
+    backgroundColor: COLORS.surface,
+  },
+  messagesNewGroupText: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.neon,
+    fontSize: 11,
+    letterSpacing: 0.6,
+  },
+  groupMemberRow: {
+    borderBottomWidth: 0,
+    marginBottom: 8,
+    borderRadius: 12,
+  },
+  groupCheckbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  groupCheckboxChecked: {
+    borderColor: COLORS.neon,
+    backgroundColor: COLORS.emerald,
+  },
+  groupCheckboxMark: {
+    color: COLORS.onNeon,
+    fontSize: 13,
+    fontFamily: DM_SANS_BOLD,
+  },
+  cancelButtonAlt: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginTop: 8,
+  },
+  messagesSpinner: {
+    marginTop: 40,
+  },
+  messagesEmpty: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 14,
+    textAlign: 'center',
+    marginTop: 40,
+    paddingHorizontal: 24,
+    lineHeight: 21,
+  },
+  messagesListContent: {
+    paddingHorizontal: 20,
+    paddingBottom: 24,
+  },
+  convoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.divider,
+  },
+  convoTextBlock: {
+    flex: 1,
+  },
+  convoName: {
+    fontFamily: DM_SANS_BOLD,
+    color: COLORS.body,
+    fontSize: 15,
+  },
+  convoPreview: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 13,
+    marginTop: 2,
+  },
+  chatHeaderTextBlock: {
+    flex: 1,
+  },
+  chatHeaderRank: {
+    fontFamily: DM_SANS,
+    color: COLORS.muted,
+    fontSize: 11,
+    letterSpacing: 0.4,
+    marginTop: 2,
+  },
+  chatListContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  msgBubbleRow: {
+    flexDirection: 'row',
+    marginVertical: 4,
+    justifyContent: 'flex-start',
+  },
+  msgBubbleRowMine: {
+    justifyContent: 'flex-end',
+  },
+  msgBubble: {
+    maxWidth: '78%',
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+    borderRadius: 16,
+    borderWidth: 1,
+  },
+  msgBubbleMine: {
+    backgroundColor: COLORS.emerald,
+    borderColor: COLORS.emerald,
+    borderBottomRightRadius: 4,
+  },
+  msgBubbleTheirs: {
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
+    borderBottomLeftRadius: 4,
+  },
+  msgText: {
+    fontFamily: DM_SANS,
+    fontSize: 14,
+    lineHeight: 20,
+    color: COLORS.body,
+  },
+  msgTextMine: {
+    color: COLORS.onNeon,
+  },
+  msgSenderLabel: {
+    fontFamily: DM_SANS_SEMI,
+    color: COLORS.neon,
+    fontSize: 11,
+    letterSpacing: 0.3,
+    marginBottom: 2,
+  },
+  chatInputRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.divider,
+  },
+  chatInput: {
+    flex: 1,
+    maxHeight: 120,
+    minHeight: 44,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontFamily: DM_SANS,
+    fontSize: 14,
+    color: COLORS.body,
+    backgroundColor: COLORS.surface,
+  },
+  chatSendBtn: {
+    height: 44,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+    backgroundColor: COLORS.neon,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatSendBtnDisabled: {
+    opacity: 0.4,
+  },
+  chatSendText: {
+    fontFamily: DM_SANS_BOLD,
+    color: COLORS.onNeon,
+    fontSize: 13,
+    letterSpacing: 0.6,
   },
 });
