@@ -1387,6 +1387,125 @@ function TierBanner({ label }: { label: string }) {
   );
 }
 
+// ---- Community tab filter system -------------------------------------------
+// Every filter below operates entirely on `communityFeed`, the same array
+// the screen already holds in memory after fetchCommunityFeed() applied RLS
+// and the blocked-author filter. No new query, table, or grant is involved —
+// this is a pure client-side re-sort/re-filter of data the user is already
+// authorized to see, so it introduces zero new security surface.
+type CommunityFilterKey = 'new' | 'popular' | 'sameRank' | 'successStories';
+
+const COMMUNITY_FILTERS: { key: CommunityFilterKey; label: string }[] = [
+  { key: 'new', label: 'New' },
+  { key: 'popular', label: 'Popular' },
+  { key: 'sameRank', label: 'Same Rank' },
+  { key: 'successStories', label: 'Success Stories' },
+];
+
+// "Popular" only considers posts from the last 4 days, so a viral post from
+// weeks ago can never permanently camp at the top of a "recent activity"
+// filter — it has to keep earning fresh engagement to stay visible.
+const POPULAR_WINDOW_MS = 4 * 24 * 60 * 60 * 1000;
+
+// Likes and replies are active, deliberate signals (someone chose to engage);
+// views are passive (a card merely scrolled past), so they're weighted less.
+function popularityScore(post: CommunityPost): number {
+  return post.likeCount * 4 + post.replyCount * 3 + post.viewCount * 1;
+}
+
+function applyCommunityFilter(
+  posts: CommunityPost[],
+  filter: CommunityFilterKey,
+  myRank: string | null,
+): CommunityPost[] {
+  const byNewest = (a: CommunityPost, b: CommunityPost) =>
+    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+
+  switch (filter) {
+    case 'popular': {
+      const cutoff = Date.now() - POPULAR_WINDOW_MS;
+      return posts
+        .filter((p) => new Date(p.createdAt).getTime() >= cutoff)
+        .sort((a, b) => {
+          const diff = popularityScore(b) - popularityScore(a);
+          return diff !== 0 ? diff : byNewest(a, b);
+        });
+    }
+    case 'sameRank':
+      return posts.filter((p) => myRank !== null && p.authorRank === myRank).sort(byNewest);
+    case 'successStories':
+      return posts.filter((p) => p.tag === 'Success Stories').sort(byNewest);
+    case 'new':
+    default:
+      return [...posts].sort(byNewest);
+  }
+}
+
+function CommunityFilterBar({ filter, onPress }: { filter: CommunityFilterKey; onPress: () => void }) {
+  const label = COMMUNITY_FILTERS.find((f) => f.key === filter)?.label ?? 'New';
+  return (
+    <Pressable onPress={onPress} style={styles.filterBarRow} hitSlop={8}>
+      <Text style={styles.filterBarIcon}>{'\u25BD'}</Text>
+      <Text style={styles.filterBarText} numberOfLines={1} ellipsizeMode="tail">
+        {`Filter: "${label}"`}
+      </Text>
+    </Pressable>
+  );
+}
+
+function CommunityFilterModal({
+  visible,
+  currentFilter,
+  onSelect,
+  onClose,
+}: {
+  visible: boolean;
+  currentFilter: CommunityFilterKey;
+  onSelect: (filter: CommunityFilterKey) => void;
+  onClose: () => void;
+}) {
+  if (!visible) {
+    return null;
+  }
+  return (
+    <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.overlayFill}>
+        <Pressable style={styles.modalBackdropFill} onPress={onClose} />
+        <View pointerEvents="box-none" style={styles.centeredCardWrap}>
+          <View style={styles.centeredCard}>
+            <SectionHeader label="FILTER FEED" />
+            {COMMUNITY_FILTERS.map((f) => {
+              const selected = f.key === currentFilter;
+              return (
+                <Pressable
+                  key={f.key}
+                  onPress={() => {
+                    onSelect(f.key);
+                    onClose();
+                  }}
+                  style={({ pressed }) => [
+                    styles.filterOptionRow,
+                    selected && styles.filterOptionRowSelected,
+                    pressed && styles.cardPressed,
+                  ]}
+                >
+                  <Text style={[styles.filterOptionText, selected && styles.filterOptionTextSelected]}>
+                    {f.label}
+                  </Text>
+                  {selected ? <Text style={styles.filterOptionCheck}>{'\u2713'}</Text> : null}
+                </Pressable>
+              );
+            })}
+            <Pressable onPress={onClose} style={styles.cancelButton}>
+              <Text style={styles.cancelButtonText}>{'\u2715'}  CLOSE</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 // Spring-based press feedback wrapper. Drop-in visual upgrade over a plain
 // Pressable: identical props and handlers, plus a buttery scale-down spring
 // on press. Purely cosmetic — no behavior changes.
@@ -3411,6 +3530,8 @@ function CommunityScreen() {
   const [inspectedPost, setInspectedPost] = useState<CommunityPost | null>(null);
   const [openPostId, setOpenPostId] = useState<string | null>(null);
   const [createPostVisible, setCreatePostVisible] = useState(false);
+  const [filter, setFilter] = useState<CommunityFilterKey>('new');
+  const [filterModalVisible, setFilterModalVisible] = useState(false);
 
   // Re-derive the open post from the live feed each render so the modal
   // reflects newly added likes/counts immediately.
@@ -3418,7 +3539,11 @@ function CommunityScreen() {
     ? communityFeed.find((post) => post.id === openPostId) ?? null
     : null;
 
-  const rankLabel = profile?.rank_title ? `RANK: ${profile.rank_title.toUpperCase()}` : 'RANK: ---';
+  const myRank = profile?.rank_title ?? null;
+  const filteredFeed = useMemo(
+    () => applyCommunityFilter(communityFeed, filter, myRank),
+    [communityFeed, filter, myRank],
+  );
 
   // Step 5.2: register a view for the current user exactly once per post per
   // session (server dedups permanently); repeat opens never re-fire.
@@ -3439,7 +3564,7 @@ function CommunityScreen() {
     <View style={styles.screenRoot}>
       <Starfield scrollY={scrollY} />
       <Reanimated.FlatList
-        data={communityFeed}
+        data={filteredFeed}
         keyExtractor={(item) => item.id}
         onScroll={onScroll}
         scrollEventThrottle={16}
@@ -3457,7 +3582,7 @@ function CommunityScreen() {
         ]}
         ListHeaderComponent={
           <View>
-            <TierBanner label={rankLabel} />
+            <CommunityFilterBar filter={filter} onPress={() => setFilterModalVisible(true)} />
             <SectionHeader label="ACTION REPORT TIMELINE" />
           </View>
         }
@@ -3467,7 +3592,9 @@ function CommunityScreen() {
           ) : (
             <View style={styles.card}>
               <Text style={styles.bodyText}>
-                The grid is quiet. Complete a challenge and broadcast it to start the timeline.
+                {communityFeed.length === 0
+                  ? 'The grid is quiet. Complete a challenge and broadcast it to start the timeline.'
+                  : 'No posts match this filter yet.'}
               </Text>
             </View>
           )
@@ -3492,6 +3619,13 @@ function CommunityScreen() {
         <Text style={styles.fabIcon}>+</Text>
         <Text style={styles.fabLabel}>NEW POST</Text>
       </SpringPressable>
+
+      <CommunityFilterModal
+        visible={filterModalVisible}
+        currentFilter={filter}
+        onSelect={setFilter}
+        onClose={() => setFilterModalVisible(false)}
+      />
 
       <InspectProfileModal
         post={inspectedPost}
@@ -4484,6 +4618,57 @@ const styles = StyleSheet.create({
     color: COLORS.muted,
     letterSpacing: 1,
     textAlign: 'center',
+  },
+
+  // ---- community filter bar / picker --------------------------------------
+  filterBarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    marginBottom: 20,
+    paddingVertical: 4,
+  },
+  filterBarIcon: {
+    fontFamily: MONO,
+    color: COLORS.neon,
+    fontSize: 13,
+    marginRight: 8,
+  },
+  filterBarText: {
+    fontFamily: MONO,
+    fontSize: 12,
+    color: COLORS.muted,
+    letterSpacing: 1,
+  },
+  filterOptionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderWidth: 1,
+    borderColor: COLORS.divider,
+    backgroundColor: COLORS.surface,
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+  },
+  filterOptionRowSelected: {
+    borderColor: COLORS.neon,
+    backgroundColor: COLORS.disabled,
+  },
+  filterOptionText: {
+    fontFamily: DM_SANS,
+    color: COLORS.body,
+    fontSize: 14,
+  },
+  filterOptionTextSelected: {
+    fontFamily: DM_SANS_BOLD,
+    color: COLORS.neon,
+  },
+  filterOptionCheck: {
+    fontFamily: MONO,
+    color: COLORS.neon,
+    fontSize: 14,
   },
 
   // ---- section headers ----------------------------------------------------
