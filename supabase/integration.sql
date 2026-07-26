@@ -119,9 +119,22 @@ CREATE TABLE IF NOT EXISTS public.community_posts (
   journal_entry_id   uuid REFERENCES public.journal_entries (id) ON DELETE SET NULL,
   title              text NOT NULL,
   content            text NOT NULL,
+  -- Optional public tag, one of a fixed set enforced below by a CHECK
+  -- constraint — a raw API call with an arbitrary tag string is rejected by
+  -- Postgres itself, not by client-side validation.
+  tag                text,
   view_count         integer NOT NULL DEFAULT 0,
   created_at         timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE public.community_posts DROP CONSTRAINT IF EXISTS community_posts_tag_check;
+ALTER TABLE public.community_posts ADD CONSTRAINT community_posts_tag_check
+  CHECK (
+    tag IS NULL OR tag IN (
+      'Success Stories', 'Struggling', 'Motivation', 'Advice',
+      'Question', 'Milestone', 'Accountability', 'Mental Health'
+    )
+  );
 
 ALTER TABLE public.community_posts ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.community_posts FROM anon, authenticated;
@@ -235,6 +248,91 @@ CREATE POLICY "Submit content reports"
 -- client; only you (service_role in the dashboard) can review them.
 
 -- ----------------------------------------------------------------------------
+-- 7b) ANTI-SPAM — BEFORE INSERT triggers on community_posts, post_replies,
+--     and messages. These run in the database itself, so they apply no
+--     matter what makes the insert call (the app, a future RPC, or someone
+--     hitting the REST API directly with a script). RLS above controls WHO
+--     can write; these triggers control WHAT and HOW OFTEN.
+--       - community_posts: title >= 3 chars, content >= 20 chars,
+--         15s cooldown per user. (15s is intentionally below
+--         complete_challenge()'s own 20s cooldown so a normal broadcast
+--         posted via a challenge completion can never be blocked by this.)
+--       - post_replies: content >= 10 chars, 8s cooldown per user
+--         (applies even when replying to your own post).
+--       - messages: non-empty, <= 2000 chars, 2s cooldown per user across
+--         every conversation (1:1 and group).
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.enforce_post_rules()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  last_post_at timestamptz;
+BEGIN
+  IF length(btrim(coalesce(NEW.title, ''))) < 3 THEN
+    RAISE EXCEPTION 'Post title must be at least 3 characters';
+  END IF;
+  IF length(btrim(coalesce(NEW.content, ''))) < 20 THEN
+    RAISE EXCEPTION 'Post must be at least 20 characters';
+  END IF;
+
+  SELECT max(created_at) INTO last_post_at
+  FROM public.community_posts
+  WHERE user_id = NEW.user_id;
+
+  IF last_post_at IS NOT NULL AND last_post_at > now() - interval '15 seconds' THEN
+    RAISE EXCEPTION 'Please wait a moment before posting again';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_enforce_post_rules ON public.community_posts;
+CREATE TRIGGER trg_enforce_post_rules
+  BEFORE INSERT ON public.community_posts
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_post_rules();
+-- Trigger functions are invoked by the trigger mechanism itself, never by a
+-- direct call — revoke EXECUTE so PostgREST doesn't expose a pointless (and
+-- broken outside trigger context) /rest/v1/rpc/enforce_post_rules endpoint.
+REVOKE ALL ON FUNCTION public.enforce_post_rules() FROM PUBLIC, anon, authenticated;
+
+CREATE OR REPLACE FUNCTION public.enforce_reply_rules()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  last_reply_at timestamptz;
+BEGIN
+  IF length(btrim(coalesce(NEW.content, ''))) < 10 THEN
+    RAISE EXCEPTION 'Reply must be at least 10 characters';
+  END IF;
+
+  SELECT max(created_at) INTO last_reply_at
+  FROM public.post_replies
+  WHERE user_id = NEW.user_id;
+
+  IF last_reply_at IS NOT NULL AND last_reply_at > now() - interval '8 seconds' THEN
+    RAISE EXCEPTION 'Please wait a moment before replying again';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_enforce_reply_rules ON public.post_replies;
+CREATE TRIGGER trg_enforce_reply_rules
+  BEFORE INSERT ON public.post_replies
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_reply_rules();
+REVOKE ALL ON FUNCTION public.enforce_reply_rules() FROM PUBLIC, anon, authenticated;
+
+-- ----------------------------------------------------------------------------
 -- 8) STREAK_DAYS — weekday tracker source of truth. Read-only for the owner;
 --    the only writer is complete_challenge().
 -- ----------------------------------------------------------------------------
@@ -282,6 +380,44 @@ CREATE TABLE IF NOT EXISTS public.messages (
   content           text NOT NULL,
   created_at        timestamptz NOT NULL DEFAULT now()
 );
+
+-- Anti-spam: non-empty, capped length, and a 2s per-user cooldown across
+-- every conversation (1:1 and group). See section 7b for community_posts /
+-- post_replies triggers of the same kind.
+CREATE OR REPLACE FUNCTION public.enforce_message_rules()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  last_msg_at timestamptz;
+BEGIN
+  IF length(btrim(coalesce(NEW.content, ''))) < 1 THEN
+    RAISE EXCEPTION 'Message cannot be empty';
+  END IF;
+  IF length(NEW.content) > 2000 THEN
+    RAISE EXCEPTION 'Message is too long';
+  END IF;
+
+  SELECT max(created_at) INTO last_msg_at
+  FROM public.messages
+  WHERE sender_id = NEW.sender_id;
+
+  IF last_msg_at IS NOT NULL AND last_msg_at > now() - interval '2 seconds' THEN
+    RAISE EXCEPTION 'You are sending messages too quickly';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_enforce_message_rules ON public.messages;
+CREATE TRIGGER trg_enforce_message_rules
+  BEFORE INSERT ON public.messages
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_message_rules();
+REVOKE ALL ON FUNCTION public.enforce_message_rules() FROM PUBLIC, anon, authenticated;
 
 ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.conversation_members ENABLE ROW LEVEL SECURITY;
@@ -529,8 +665,12 @@ REVOKE ALL ON FUNCTION public.get_daily_quote() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.get_daily_quote() TO authenticated;
 
 -- ---- add_journal_entry(): free-form private journal entry, no challenge
--- required. Server-validated length; the ONLY insert path besides
--- complete_challenge() into journal_entries.
+-- required. Server-validated length + a 15s cooldown (checked against the
+-- most recent journal_entries row for this user, regardless of whether it
+-- came from this function or complete_challenge() — closes the loophole of
+-- alternating between the two to bypass either one's own cooldown). The
+-- ONLY insert paths into journal_entries are this function and
+-- complete_challenge().
 CREATE OR REPLACE FUNCTION public.add_journal_entry(p_content text, p_title text DEFAULT NULL)
 RETURNS public.journal_entries
 LANGUAGE plpgsql
@@ -538,10 +678,11 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-  uid     uuid := auth.uid();
-  v_clean text := btrim(p_content);
-  v_title text := nullif(btrim(coalesce(p_title, '')), '');
-  v_row   public.journal_entries;
+  uid           uuid := auth.uid();
+  v_clean       text := btrim(p_content);
+  v_title       text := nullif(btrim(coalesce(p_title, '')), '');
+  v_row         public.journal_entries;
+  last_entry_at timestamptz;
 BEGIN
   IF uid IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -554,6 +695,14 @@ BEGIN
   END IF;
   IF v_title IS NOT NULL AND length(v_title) > 80 THEN
     RAISE EXCEPTION 'Title too long (max 80 chars)';
+  END IF;
+
+  SELECT max(created_at) INTO last_entry_at
+  FROM public.journal_entries
+  WHERE user_id = uid;
+
+  IF last_entry_at IS NOT NULL AND last_entry_at > now() - interval '15 seconds' THEN
+    RAISE EXCEPTION 'Please wait a moment before adding another entry';
   END IF;
 
   INSERT INTO public.journal_entries (user_id, challenge_id, content, title, is_broadcasted)
@@ -609,6 +758,9 @@ GRANT EXECUTE ON FUNCTION public.increment_post_view(uuid) TO authenticated;
 -- the challenge row itself (never trusts the client), only bumps
 -- streak_count on the FIRST completion of the local calendar day, and
 -- optionally broadcasts to the community feed — all in one transaction.
+-- NOTE: a too-short broadcast title (< 3 chars) falls back to 'Field
+-- Report' rather than raising, so it can never trip community_posts'
+-- own length trigger (section 7b) and roll back the whole completion.
 CREATE OR REPLACE FUNCTION public.complete_challenge(
   p_challenge_id uuid,
   p_journal_text text,
@@ -630,6 +782,7 @@ DECLARE
   v_xp             integer := 0;
   v_journal_id     uuid;
   v_journal_title  text := nullif(btrim(coalesce(p_journal_title, '')), '');
+  v_post_title     text;
   v_is_first_today boolean;
   v_new_streak     integer;
 BEGIN
@@ -678,8 +831,13 @@ BEGIN
   RETURNING id INTO v_journal_id;
 
   IF p_broadcast THEN
+    v_post_title := btrim(coalesce(p_post_title, ''));
+    IF length(v_post_title) < 3 THEN
+      v_post_title := 'Field Report';
+    END IF;
+
     INSERT INTO public.community_posts (user_id, title, content, journal_entry_id)
-    VALUES (uid, coalesce(nullif(btrim(p_post_title), ''), 'Field Report'), btrim(p_journal_text), v_journal_id);
+    VALUES (uid, v_post_title, btrim(p_journal_text), v_journal_id);
   END IF;
 
   v_is_first_today := profile_row.last_streak_date IS DISTINCT FROM effective_date;
@@ -723,8 +881,9 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-  uid   uuid := auth.uid();
-  convo uuid;
+  uid           uuid := auth.uid();
+  convo         uuid;
+  last_convo_at timestamptz;
 BEGIN
   IF uid IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -747,8 +906,20 @@ BEGIN
     RETURN convo;
   END IF;
 
+  -- Cooldown only applies to actually CREATING a new conversation — opening
+  -- an existing one (the branch above) is unaffected, so normal messaging
+  -- with people you already talk to is never slowed down. Checked against
+  -- profiles.last_conversation_created_at, which only this function and
+  -- create_group_conversation() ever update.
+  SELECT last_conversation_created_at INTO last_convo_at FROM public.profiles WHERE id = uid;
+  IF last_convo_at IS NOT NULL AND last_convo_at > now() - interval '10 seconds' THEN
+    RAISE EXCEPTION 'Please wait a moment before starting another conversation';
+  END IF;
+
   INSERT INTO public.conversations DEFAULT VALUES RETURNING id INTO convo;
   INSERT INTO public.conversation_members (conversation_id, user_id) VALUES (convo, uid), (convo, p_other_user);
+
+  UPDATE public.profiles SET last_conversation_created_at = now() WHERE id = uid;
 
   RETURN convo;
 END;
@@ -757,9 +928,12 @@ REVOKE ALL ON FUNCTION public.find_or_create_direct_conversation(uuid) FROM PUBL
 GRANT EXECUTE ON FUNCTION public.find_or_create_direct_conversation(uuid) TO authenticated;
 
 -- ---- create_group_conversation(): the only way a group chat is created.
--- Validates 1-19 other members, all must be real profiles. anon explicitly
--- has EXECUTE revoked (Postgres auto-grants EXECUTE to PUBLIC by default on
--- function creation, which silently includes anon unless revoked here).
+-- Validates 1-19 other members, all must be real profiles, and enforces the
+-- same 10s "new conversation" cooldown as find_or_create_direct_conversation
+-- (shared via profiles.last_conversation_created_at) since this function
+-- always creates a brand new conversation. anon explicitly has EXECUTE
+-- revoked (Postgres auto-grants EXECUTE to PUBLIC by default on function
+-- creation, which silently includes anon unless revoked here).
 CREATE OR REPLACE FUNCTION public.create_group_conversation(p_member_ids uuid[], p_title text DEFAULT NULL)
 RETURNS uuid
 LANGUAGE plpgsql
@@ -772,6 +946,7 @@ DECLARE
   member uuid;
   members uuid[];
   found_count int;
+  last_convo_at timestamptz;
 BEGIN
   IF uid IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
@@ -796,6 +971,11 @@ BEGIN
     RAISE EXCEPTION 'One or more selected users do not exist';
   END IF;
 
+  SELECT last_conversation_created_at INTO last_convo_at FROM public.profiles WHERE id = uid FOR UPDATE;
+  IF last_convo_at IS NOT NULL AND last_convo_at > now() - interval '10 seconds' THEN
+    RAISE EXCEPTION 'Please wait a moment before starting another conversation';
+  END IF;
+
   INSERT INTO public.conversations (is_group, title)
   VALUES (true, nullif(trim(coalesce(p_title, '')), ''))
   RETURNING id INTO convo;
@@ -807,6 +987,8 @@ BEGIN
     VALUES (convo, member)
     ON CONFLICT (conversation_id, user_id) DO NOTHING;
   END LOOP;
+
+  UPDATE public.profiles SET last_conversation_created_at = now() WHERE id = uid;
 
   RETURN convo;
 END;

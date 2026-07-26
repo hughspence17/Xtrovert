@@ -37,6 +37,7 @@ export type CommunityPostRow = {
   user_id: string;
   title: string;
   content: string;
+  tag: PostTag | null;
   journal_entry_id: string | null;
   view_count: number;
   like_count: number;
@@ -47,6 +48,24 @@ export type CommunityPostRow = {
   author_bio: string;
   liked_by_me: boolean;
 };
+
+// ---- community post tags ----------------------------------------------------
+// Fixed set enforced server-side by a CHECK constraint on community_posts.tag
+// — the client list below is for UI convenience only; a hacker sending an
+// arbitrary tag value via a raw API call is rejected by the database itself,
+// not by this list.
+export const POST_TAGS = [
+  'Success Stories',
+  'Struggling',
+  'Motivation',
+  'Advice',
+  'Question',
+  'Milestone',
+  'Accountability',
+  'Mental Health',
+] as const;
+
+export type PostTag = (typeof POST_TAGS)[number];
 
 /** public.post_replies joined with author profile */
 export type PostReplyRow = {

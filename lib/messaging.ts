@@ -230,20 +230,33 @@ export async function fetchMessages(
   }
 }
 
+export type SendMessageResult = { ok: boolean; error?: string };
+
+/**
+ * A per-user, per-2-second cooldown (across every conversation, including
+ * group chats) is enforced by a database trigger on `messages` — this is
+ * true regardless of what client sends the insert, so a script hammering
+ * the API directly is blocked the same way the app is.
+ */
 export async function sendMessage(
   conversationId: string,
   senderId: string,
   content: string,
-): Promise<boolean> {
+): Promise<SendMessageResult> {
   try {
+    const trimmed = content.trim();
+    if (trimmed.length === 0) {
+      return { ok: false, error: 'Message cannot be empty' };
+    }
     const { error } = await supabase
       .from('messages')
-      .insert({ conversation_id: conversationId, sender_id: senderId, content: content.trim() });
+      .insert({ conversation_id: conversationId, sender_id: senderId, content: trimmed });
     if (error) throw error;
-    return true;
+    return { ok: true };
   } catch (err) {
-    console.warn('[messaging] send failed:', err instanceof Error ? err.message : err);
-    return false;
+    const message = err instanceof Error ? err.message : 'Could not send message';
+    console.warn('[messaging] send failed:', message);
+    return { ok: false, error: message };
   }
 }
 

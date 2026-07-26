@@ -176,7 +176,7 @@ Supabase SQL Editor to create tables, functions, triggers, and RLS policies.
 | `journal_entries` | Private reflections (`content`, `is_broadcasted`), either linked to a challenge or free-form (`challenge_id IS NULL`) via `add_journal_entry()`. |
 | `streak_days` | One row per user per calendar day a challenge was first completed that day — real history backing the weekly dot tracker. Read-only for clients; only `complete_challenge()` writes to it. |
 | `daily_quotes` | Motivational quote pool for the Home quote card. **Zero client grants at all** (not even `SELECT`) — the only access path is `get_daily_quote()`, which deterministically returns one quote per calendar day. |
-| `community_posts` | Broadcasted / standalone posts (`title`, `content`, `view_count`, `journal_entry_id`). |
+| `community_posts` | Broadcasted / standalone posts (`title`, `content`, `tag`, `view_count`, `journal_entry_id`). `tag` is optional and constrained to a fixed set (`Success Stories`, `Struggling`, `Motivation`, `Advice`, `Question`, `Milestone`, `Accountability`, `Mental Health`) by a `CHECK` constraint. |
 | `post_likes` / `post_replies` / `post_views` | Community engagement + per-user view dedup. |
 | `blocked_users` / `content_reports` | Safety & moderation. |
 | `conversations` / `conversation_members` / `messages` | 1:1 **and group** real-time messaging (`conversations.is_group`, `conversations.title`). |
@@ -195,6 +195,20 @@ Supabase SQL Editor to create tables, functions, triggers, and RLS policies.
 - **`create_group_conversation(p_member_ids, p_title)`** — creates a group chat (2-20 members incl. caller); validates every target id is a real profile, caps membership, de-dupes. `is_conversation_member()`/RLS need no changes for groups — they already generalize to N members.
 - **`is_conversation_member()`** — SECURITY DEFINER helper used by messaging RLS to avoid recursion.
 - **`evaluate_rank_on_score_change`** (trigger) — promotes `rank_title` when `social_score` crosses a rank threshold.
+
+### Anti-spam / rate limiting
+
+RLS controls *who* can write a row; these `BEFORE INSERT` triggers/checks control *what* and *how often*, and they run inside Postgres itself — a script calling the raw Supabase REST/JS API directly is bound by them exactly the same as the app is:
+
+| Surface | Minimum length | Cooldown |
+| --- | --- | --- |
+| `community_posts` (`enforce_post_rules`) | title ≥ 3 chars, content ≥ 20 chars | 15s per user |
+| `post_replies` (`enforce_reply_rules`) | content ≥ 10 chars | 8s per user (incl. replying to your own post) |
+| `messages` (`enforce_message_rules`) | non-empty, ≤ 2000 chars | 2s per user, across every conversation (1:1 + group) |
+| `add_journal_entry()` | 60-4000 chars | 15s per user (shared with `complete_challenge()`'s journal writes) |
+| `complete_challenge()` | journal 60-4000 chars | 20s per user between completions |
+
+The 15s post cooldown is deliberately shorter than `complete_challenge()`'s own 20s cooldown so a normal challenge broadcast can never be blocked by it. A too-short broadcast title falls back to `'Field Report'` rather than raising, so it can never abort an otherwise-valid challenge completion.
 
 ### Row Level Security
 

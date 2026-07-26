@@ -99,7 +99,8 @@ import type {
   ConversationMemberLite,
   MessageRow,
 } from './lib/schema';
-import { REPORT_REASONS } from './lib/schema';
+import { REPORT_REASONS, POST_TAGS } from './lib/schema';
+import type { PostTag } from './lib/schema';
 
 // ============================================================================
 // SECTION 1 — DESIGN TOKENS ("TACTICAL GREEN" SYSTEM)
@@ -228,6 +229,7 @@ interface CommunityPost {
   authorBio: string;
   title: string;
   body: string;
+  tag: PostTag | null;
   createdAt: string;
   viewCount: number;
   likeCount: number;
@@ -276,7 +278,7 @@ interface AppContextShape {
   reportPost: (postId: string, reportedUserId: string, reason: string) => Promise<boolean>;
   blockAuthor: (blockedId: string) => Promise<void>;
   registerView: (postId: string) => Promise<void>;
-  createPost: (title: string, body: string) => Promise<boolean>;
+  createPost: (title: string, body: string, tag: PostTag | null) => Promise<{ ok: boolean; error?: string }>;
   setReplyCount: (postId: string, count: number) => void;
   // Progress (Step 6)
   completedCount: number;
@@ -441,6 +443,7 @@ function mapCommunityPost(row: CommunityPostRow): CommunityPost {
     authorBio: row.author_bio,
     title: row.title,
     body: row.content,
+    tag: row.tag,
     createdAt: row.created_at,
     viewCount: row.view_count,
     likeCount: row.like_count,
@@ -685,15 +688,15 @@ function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const createPost = useCallback(
-    async (title: string, body: string) => {
+    async (title: string, body: string, tag: PostTag | null) => {
       if (!userId) {
-        return false;
+        return { ok: false, error: 'Not signed in' };
       }
-      const ok = await createStandalonePost(userId, title, body);
-      if (ok) {
+      const result = await createStandalonePost(userId, title, body, tag);
+      if (result.ok) {
         await refreshFeed();
       }
-      return ok;
+      return result;
     },
     [userId, refreshFeed],
   );
@@ -1219,6 +1222,7 @@ function ChatView({
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState('');
   const listRef = useRef<FlatList<MessageRow>>(null);
 
   const reload = useCallback(async () => {
@@ -1231,6 +1235,7 @@ function ChatView({
   useEffect(() => {
     let mounted = true;
     setLoading(true);
+    setSendError('');
     (async () => {
       const blocked = userId ? await fetchBlockedIds(userId) : new Set<string>();
       const msgs = await fetchMessages(chat.conversationId, blocked);
@@ -1257,12 +1262,17 @@ function ChatView({
       return;
     }
     setSending(true);
+    setSendError('');
     setDraft('');
-    const ok = await sendMessage(chat.conversationId, userId, text);
-    if (ok) {
+    // A 2-second per-user cooldown across every conversation is enforced by
+    // a database trigger — a fast typist never hits it, but a script trying
+    // to flood messages does, and the server rejection is surfaced here.
+    const result = await sendMessage(chat.conversationId, userId, text);
+    if (result.ok) {
       await reload();
     } else {
       setDraft(text);
+      setSendError(result.error ?? 'Could not send message.');
     }
     setSending(false);
   };
@@ -1331,6 +1341,8 @@ function ChatView({
           }}
         />
       )}
+
+      {sendError ? <Text style={[styles.errorText, styles.chatErrorText]}>{sendError}</Text> : null}
 
       <View style={styles.chatInputRow}>
         <TextInput
@@ -2822,6 +2834,12 @@ function FeedCard({
         {post.title}
       </Text>
 
+      {post.tag ? (
+        <View style={styles.postTagPill}>
+          <Text style={styles.postTagPillText}>{post.tag.toUpperCase()}</Text>
+        </View>
+      ) : null}
+
       <Text style={styles.bodyText}>{post.body}</Text>
 
       <View style={styles.feedBottomRow}>
@@ -2997,6 +3015,7 @@ function PostDetailModal({
   const [loadingReplies, setLoadingReplies] = useState(false);
   const [sending, setSending] = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
+  const [replyError, setReplyError] = useState('');
 
   const postId = post?.id ?? null;
 
@@ -3004,6 +3023,7 @@ function PostDetailModal({
     if (!postId) {
       setReplyText('');
       setReplies([]);
+      setReplyError('');
       return;
     }
     let mounted = true;
@@ -3024,7 +3044,9 @@ function PostDetailModal({
     return null;
   }
 
-  const canSubmit = replyText.trim().length > 0 && !sending;
+  // Server-side minimum (10 chars, enforced by a database trigger) is
+  // mirrored here only so the button disables sensibly.
+  const canSubmit = replyText.trim().length >= 10 && !sending;
   const isOwnPost = post.userId === currentUserId;
 
   const handleSend = async () => {
@@ -3032,10 +3054,11 @@ function PostDetailModal({
       return;
     }
     setSending(true);
+    setReplyError('');
     const text = replyText.trim();
     setReplyText('');
-    const ok = await addReplyDb(post.id, currentUserId, text);
-    if (ok) {
+    const result = await addReplyDb(post.id, currentUserId, text);
+    if (result.ok) {
       const rows = await fetchReplies(post.id);
       setReplies(rows);
       // Keep the feed card's badge (and "No replies yet" text) in sync the
@@ -3043,6 +3066,7 @@ function PostDetailModal({
       onReplyCountChange(post.id, rows.length);
     } else {
       setReplyText(text);
+      setReplyError(result.error ?? 'Could not post reply. Try again.');
     }
     setSending(false);
   };
@@ -3089,6 +3113,11 @@ function PostDetailModal({
                 <Text style={styles.feedTitle} numberOfLines={2} ellipsizeMode="tail">
                   {post.title}
                 </Text>
+                {post.tag ? (
+                  <View style={styles.postTagPill}>
+                    <Text style={styles.postTagPillText}>{post.tag.toUpperCase()}</Text>
+                  </View>
+                ) : null}
                 <Text style={styles.bodyText}>{post.body}</Text>
 
                 <View style={styles.feedBottomRow}>
@@ -3171,6 +3200,8 @@ function PostDetailModal({
                 />
               </View>
 
+              {replyError ? <Text style={styles.errorText}>{replyError}</Text> : null}
+
               <View
                 pointerEvents={canSubmit ? 'auto' : 'none'}
                 style={{ opacity: canSubmit ? 1 : 0.4 }}
@@ -3212,16 +3243,22 @@ function CreatePostModal({
 }: {
   visible: boolean;
   onClose: () => void;
-  onSubmit: (title: string, body: string) => void;
+  onSubmit: (title: string, body: string, tag: PostTag | null) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const insets = useSafeAreaInsets();
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
+  const [tag, setTag] = useState<PostTag | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [errorText, setErrorText] = useState('');
 
   useEffect(() => {
     if (!visible) {
       setTitle('');
       setBody('');
+      setTag(null);
+      setSubmitting(false);
+      setErrorText('');
     }
   }, [visible]);
 
@@ -3229,13 +3266,24 @@ function CreatePostModal({
     return null;
   }
 
-  const canSubmit = title.trim().length > 0 && body.trim().length >= 10;
+  // Server-side minimums (title 3+, body 20+, enforced by a database
+  // trigger) are mirrored here only so the button disables sensibly — the
+  // real, unbypassable rule lives in Postgres, not in this check.
+  const canSubmit = title.trim().length >= 3 && body.trim().length >= 20 && !submitting;
 
-  const handlePost = () => {
+  const handlePost = async () => {
     if (!canSubmit) {
       return;
     }
-    onSubmit(title.trim(), body.trim());
+    setSubmitting(true);
+    setErrorText('');
+    const result = await onSubmit(title.trim(), body.trim(), tag);
+    if (result.ok) {
+      onClose();
+    } else {
+      setErrorText(result.error ?? 'Could not post. Try again.');
+    }
+    setSubmitting(false);
   };
 
   return (
@@ -3292,8 +3340,31 @@ function CreatePostModal({
                   placeholderTextColor={COLORS.muted}
                   textAlignVertical="top"
                   keyboardAppearance="dark"
+                  editable={!submitting}
                 />
               </View>
+
+              <View style={styles.overlayCard}>
+                <SectionHeader label="TAG (OPTIONAL)" />
+                <View style={styles.tagPickerRow}>
+                  {POST_TAGS.map((t) => {
+                    const selected = tag === t;
+                    return (
+                      <Pressable
+                        key={t}
+                        onPress={() => setTag(selected ? null : t)}
+                        style={[styles.tagChip, selected && styles.tagChipSelected]}
+                      >
+                        <Text style={[styles.tagChipText, selected && styles.tagChipTextSelected]}>
+                          {t}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+
+              {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
 
               <View
                 pointerEvents={canSubmit ? 'auto' : 'none'}
@@ -3307,7 +3378,9 @@ function CreatePostModal({
                     pressed && styles.primaryButtonPressed,
                   ]}
                 >
-                  <Text style={styles.primaryButtonText}>{'\u27A4'}  PUBLISH TO GRID</Text>
+                  <Text style={styles.primaryButtonText}>
+                    {submitting ? 'PUBLISHING…' : `${'\u27A4'}  PUBLISH TO GRID`}
+                  </Text>
                 </Pressable>
               </View>
             </ScrollView>
@@ -3450,10 +3523,7 @@ function CommunityScreen() {
       <CreatePostModal
         visible={createPostVisible}
         onClose={() => setCreatePostVisible(false)}
-        onSubmit={async (title, body) => {
-          await createPost(title, body);
-          setCreatePostVisible(false);
-        }}
+        onSubmit={(title, body, tag) => createPost(title, body, tag)}
       />
     </View>
   );
@@ -3490,6 +3560,11 @@ function JournalEntryCard({
           </Text>
         ) : null}
       </View>
+      {entry.title ? (
+        <Text style={styles.journalEntryTitle} numberOfLines={1} ellipsizeMode="tail">
+          {entry.title}
+        </Text>
+      ) : null}
       <View style={styles.questDivider} />
       <Text style={styles.bodyText} numberOfLines={expanded ? undefined : 3} ellipsizeMode="tail">
         {entry.content}
@@ -4044,6 +4119,11 @@ function ProgressScreen() {
                   </Text>
                 ) : null}
               </View>
+              {entry.title ? (
+                <Text style={styles.journalEntryTitle} numberOfLines={1} ellipsizeMode="tail">
+                  {entry.title}
+                </Text>
+              ) : null}
               <View style={styles.growthDivider} />
               <Text style={styles.bodyText} numberOfLines={3} ellipsizeMode="tail">
                 {entry.content}
@@ -5222,6 +5302,12 @@ const styles = StyleSheet.create({
     fontSize: 11,
     letterSpacing: 0.5,
   },
+  journalEntryTitle: {
+    fontFamily: DM_SANS_BOLD,
+    color: COLORS.body,
+    fontSize: 15,
+    marginTop: 6,
+  },
   tapHintText: {
     fontFamily: MONO,
     color: COLORS.neon,
@@ -5688,6 +5774,53 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginBottom: 12,
     textAlign: 'center',
+  },
+  chatErrorText: {
+    marginTop: 6,
+    marginBottom: 0,
+    paddingHorizontal: 12,
+  },
+  tagPickerRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  tagChip: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: COLORS.surface,
+  },
+  tagChipSelected: {
+    borderColor: COLORS.neon,
+    backgroundColor: COLORS.disabled,
+  },
+  tagChipText: {
+    fontFamily: MONO,
+    color: COLORS.muted,
+    fontSize: 11,
+    letterSpacing: 0.4,
+  },
+  tagChipTextSelected: {
+    color: COLORS.neon,
+  },
+  postTagPill: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: COLORS.neon,
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  postTagPillText: {
+    fontFamily: MONO,
+    color: COLORS.neon,
+    fontSize: 10,
+    letterSpacing: 0.5,
   },
 
   // ---- Home tab personal journal feed (Step 4) -----------------------------

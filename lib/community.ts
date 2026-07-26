@@ -2,7 +2,7 @@
 // XTROVERT — community feed, engagement & moderation (Step 5)
 // ============================================================================
 import { supabase } from './supabase';
-import type { CommunityPostRow, PostReplyRow } from './schema';
+import type { CommunityPostRow, PostReplyRow, PostTag } from './schema';
 
 /** IDs the current user has blocked — used to filter feeds/messages client-side. */
 export async function fetchBlockedIds(userId: string): Promise<Set<string>> {
@@ -47,7 +47,7 @@ export async function fetchCommunityFeed(userId: string): Promise<CommunityPostR
 
     const { data: posts, error } = await supabase
       .from('community_posts')
-      .select('id, user_id, title, content, journal_entry_id, view_count, created_at')
+      .select('id, user_id, title, content, tag, journal_entry_id, view_count, created_at')
       .order('created_at', { ascending: false })
       .limit(100);
     if (error) throw error;
@@ -90,6 +90,7 @@ export async function fetchCommunityFeed(userId: string): Promise<CommunityPostR
         user_id: authorId,
         title: String(r.title ?? ''),
         content: String(r.content ?? ''),
+        tag: r.tag ? (String(r.tag) as PostTag) : null,
         journal_entry_id: r.journal_entry_id ? String(r.journal_entry_id) : null,
         view_count: Number.isFinite(Number(r.view_count)) ? Number(r.view_count) : 0,
         like_count: likeCounts.get(id) ?? 0,
@@ -158,16 +159,27 @@ export async function fetchReplies(postId: string): Promise<PostReplyRow[]> {
   }
 }
 
-export async function addReply(postId: string, userId: string, content: string): Promise<boolean> {
+export type AddReplyResult = { ok: boolean; error?: string };
+
+/**
+ * Minimum length (10 chars) and a per-user cooldown (8s, applies even to
+ * replying on your own posts) are enforced by a database trigger — this
+ * function just surfaces whatever the server actually decided, it never
+ * decides itself whether the reply is "good enough".
+ */
+export async function addReply(postId: string, userId: string, content: string): Promise<AddReplyResult> {
   try {
     const trimmed = content.trim();
-    if (trimmed.length === 0) return false;
+    if (trimmed.length === 0) {
+      return { ok: false, error: 'Reply cannot be empty' };
+    }
     const { error } = await supabase.from('post_replies').insert({ post_id: postId, user_id: userId, content: trimmed });
     if (error) throw error;
-    return true;
+    return { ok: true };
   } catch (err) {
-    console.warn('[community] add reply failed:', err instanceof Error ? err.message : err);
-    return false;
+    const message = err instanceof Error ? err.message : 'Could not post reply';
+    console.warn('[community] add reply failed:', message);
+    return { ok: false, error: message };
   }
 }
 
@@ -213,19 +225,35 @@ export async function blockUser(userId: string, blockedId: string): Promise<void
   }
 }
 
-/** Free-standing community post, not linked to any journal entry. */
-export async function createStandalonePost(userId: string, title: string, content: string): Promise<boolean> {
+export type CreatePostResult = { ok: boolean; error?: string };
+
+/**
+ * Free-standing community post, not linked to any journal entry. Minimum
+ * length (title 3+, body 20+) and a per-user 15s cooldown are enforced by a
+ * database trigger regardless of what this client sends. `tag` is optional
+ * and, if provided, must be one of the fixed POST_TAGS values — the database
+ * CHECK constraint rejects anything else even if this validation is bypassed.
+ */
+export async function createStandalonePost(
+  userId: string,
+  title: string,
+  content: string,
+  tag?: PostTag | null,
+): Promise<CreatePostResult> {
   try {
     const trimmedTitle = title.trim();
     const trimmedContent = content.trim();
-    if (trimmedTitle.length === 0 || trimmedContent.length === 0) return false;
+    if (trimmedTitle.length === 0 || trimmedContent.length === 0) {
+      return { ok: false, error: 'Title and body are required' };
+    }
     const { error } = await supabase
       .from('community_posts')
-      .insert({ user_id: userId, title: trimmedTitle, content: trimmedContent, journal_entry_id: null });
+      .insert({ user_id: userId, title: trimmedTitle, content: trimmedContent, tag: tag ?? null, journal_entry_id: null });
     if (error) throw error;
-    return true;
+    return { ok: true };
   } catch (err) {
-    console.warn('[community] create post failed:', err instanceof Error ? err.message : err);
-    return false;
+    const message = err instanceof Error ? err.message : 'Could not create post';
+    console.warn('[community] create post failed:', message);
+    return { ok: false, error: message };
   }
 }

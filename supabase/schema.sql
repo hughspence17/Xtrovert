@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   last_username_change_at       timestamptz,
   last_bio_change_at            timestamptz,
   last_challenge_completed_at   timestamptz,
+  -- Updated only by find_or_create_direct_conversation()/
+  -- create_group_conversation() the moment they actually create a brand new
+  -- conversation (never when reopening an existing one) — backs the 10s
+  -- "new conversation" cooldown in supabase/integration.sql.
+  last_conversation_created_at  timestamptz,
   created_at                    timestamptz NOT NULL DEFAULT timezone('utc', now()),
   updated_at                    timestamptz NOT NULL DEFAULT timezone('utc', now())
   -- NOTE: usernames are intentionally NOT unique — duplicates are allowed by
